@@ -55,7 +55,18 @@ def node(name, props=(), children=()):
     return n
 
 
-def build_kugo_adt(seed=None):
+def d22ap_product(path):
+    """/product properties of the real iPhone X device tree (MobileGestalt reads them)."""
+    if not path or not os.path.exists(path):
+        return None
+    root, _ = adt.parse(open(path, 'rb').read())
+    for c in root.children:
+        if c.prop('name') == b'product\0':
+            return [(k, v) for k, f, v in c.props if not f and k not in ('name', 'AAPL,phandle')]
+    return None
+
+
+def build_kugo_adt(seed=None, product_from=None):
     phys_base = PHYS_BASE
     mem_size = MEM_SIZE
 
@@ -182,13 +193,17 @@ def build_kugo_adt(seed=None):
     ])
     cpus = node('cpus', [ph(), ('#address-cells', u32(1)), ('#size-cells', u32(0))], [cpu0])
 
-    product = node('product', [
-        ph(),
-        ('product-id', u32(0x1003)),
-        ('product-name', cstr('iPhone X')),
-        ('model-number', cstr('D22AP')),
-        ('device-class', cstr('iPhone')),
-    ])
+    product_props = d22ap_product(product_from)
+    if product_props:
+        product = node('product', [ph()] + product_props)
+    else:
+        product = node('product', [
+            ph(),
+            ('product-id', u32(0x1003)),
+            ('product-name', cstr('iPhone X')),
+            ('model-number', cstr('D22AP')),
+            ('device-class', cstr('iPhone')),
+        ])
 
     pram = node('pram', [ph(), ('reg', u64(panic_base, PANIC_LOG_SIZE))])
 
@@ -214,11 +229,13 @@ def build_kugo_adt(seed=None):
 def main():
     parser = argparse.ArgumentParser(description='Generate the kugo Apple Device Tree')
     parser.add_argument('output', help='output .adt file')
+    parser.add_argument('--product-from', help="iPhone X device tree (d22ap.adt, from the IPSW) for /product")
     args = parser.parse_args()
-    data = adt.serialize(build_kugo_adt())
+    data = adt.serialize(build_kugo_adt(product_from=args.product_from))
     with open(args.output, 'wb') as f:
         f.write(data)
-    print(f'kugo ADT: {args.output} ({len(data)} bytes)')
+    print(f'kugo ADT: {args.output} ({len(data)} bytes)'
+          f'{", /product from " + args.product_from if d22ap_product(args.product_from) else ""}')
 
 
 if __name__ == '__main__':

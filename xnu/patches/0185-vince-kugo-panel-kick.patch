@@ -1,0 +1,60 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index bf90e43..2e22e98 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -489,6 +489,35 @@ AppleCLCD::present(const uint8_t *rec)
+ }
+ 
+ #if defined(ARM64_BOARD_CONFIG_VINCE)
++#include <pexpert/arm64/board_config.h>
++#if defined(KUGO)
++#include <machine/machine_routines.h>
++
++/*
++ * kugo's panel is command mode (VINCE.h): the 24-bpp buffer only reaches the screen when MDP CTL0
++ * START sends it. Wait for the previous transfer (PING_PONG_0_DONE) first; a START mid-transfer
++ * desyncs the panel.
++ */
++static void
++kugo_panel_kick(void)
++{
++	static volatile uint8_t *mdss;
++	if (mdss == NULL) {
++		mdss = (volatile uint8_t *)ml_io_map(KUGO_MDSS_PHYS, 0x3000);
++		if (mdss == NULL) {
++			return;
++		}
++	}
++	volatile uint32_t *status = (volatile uint32_t *)(mdss + KUGO_MDP_INTR_STATUS);
++	for (unsigned int i = 0; i < 0x100000u && !(*status & (1u << KUGO_PP0_DONE_BIT)); i++) {
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(mdss + KUGO_MDP_INTR_CLEAR) = 1u << KUGO_PP0_DONE_BIT;
++	*(volatile uint32_t *)(mdss + KUGO_CTL0_START) = 1;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++#endif
++
+ /*
+  * 32-bpp shadow (B, G, R, X) to the 24-bpp panel (B, G, R): four pixels into three words, the whole frame
+  * (about 9 MB read, 7 MB written; a few ms, at sweetfb_hz).
+@@ -518,6 +547,9 @@ AppleCLCD::flushPanel(void)
+ 				d[2] = p2 >> 16 | p3 << 8;
+ 			}
+ 		}
++#if defined(KUGO)
++		kugo_panel_kick();
++#endif
+ 		return;
+ 	}
+ 	for (uint32_t y = 0; y < fHeight; y++) {
+@@ -537,6 +569,9 @@ AppleCLCD::flushPanel(void)
+ 			*db++ = (uint8_t)(*s >> 16);
+ 		}
+ 	}
++#if defined(KUGO)
++	kugo_panel_kick();
++#endif
+ }
+ #endif
+ 
