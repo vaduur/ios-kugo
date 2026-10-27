@@ -1,0 +1,146 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index d9223a1..b2f2860 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1872,6 +1872,17 @@ sweet_early_map_final(void)
+ 		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE) |
+ 		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+ 	}
++	/* And the 2 MiB block holding the ramoops record for the console mirror (sweet_early.c). */
++	{
++		vm_map_address_t block_va = va + ((uint64_t)(fb_num_blocks + 1) * ARM_TT_L2_SIZE);
++		tt_entry_t *slot = &l2[(block_va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
++		assert(*slot == ARM_TTE_EMPTY);
++		*slot = ((uint64_t)KUGO_PSTORE_PHYS & ~(uint64_t)(ARM_TT_L2_SIZE - 1)) |
++		    ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++		    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
++		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
++		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	}
+ #endif
+ 	__asm__ volatile("dsb ishst" ::: "memory");
+ }
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index c4c2d98..1f8e6d9 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -864,6 +864,9 @@ Lkernelcache_base_found:
+ 	 */
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	str		x11, [x25]
++	/* Kernel console mirror in the ramoops record (VINCE.h): L1[1], VA = PA 0x40000000..0x7fffffff, Normal-NC. */
++	MOV64	x11, (0x40000000 | ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
++	str		x11, [x25, #8]
+ #endif
+ 
+ 	/* Stage 0B: green 48x32 band - bootstrap V=P, KVA and FB mapped */
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index c1c95bf..f130490 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -47,6 +47,31 @@ kugo_early_kick(void)
+ 	for (unsigned int i = 0; i < 0x100000u && !(*status & (1u << KUGO_PP0_DONE_BIT)); i++) {
+ 	}
+ }
++
++/* pstore record (VINCE.h): PA (MMU off) / V=P L1[1] block (start.s), then the KVA block after the MDSS one. */
++static volatile uint8_t *early_plog = (volatile uint8_t *)(uintptr_t)KUGO_PSTORE_PHYS;
++
++/* Append to the console mirror; once the record is full, later output is dropped (the start matters most). */
++void
++kugo_plog_putc(char c)
++{
++	volatile uint32_t *hdr = (volatile uint32_t *)early_plog;
++	if (hdr[0] != KUGO_PSTORE_SIG) {
++		hdr[1] = 0;
++		hdr[2] = 0;
++		hdr[0] = KUGO_PSTORE_SIG;
++	}
++	uint32_t pos = hdr[2];
++	if (pos >= KUGO_PSTORE_SIZE - 12) {
++		return;
++	}
++	early_plog[12 + pos] = (uint8_t)c;
++	hdr[1] = pos + 1;
++	hdr[2] = pos + 1;
++	if (c == '\n') {
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++}
+ #endif
+ 
+ void
+@@ -56,6 +81,8 @@ sweet_early_relocate(uint64_t base)
+ #if defined(KUGO)
+ 	early_fb = (volatile uint8_t *)(uintptr_t)base;
+ 	early_mdss = (volatile uint8_t *)(uintptr_t)(base + (uint64_t)KUGO_FB_BLOCKS * ARM_TT_L2_SIZE);
++	early_plog = (volatile uint8_t *)(uintptr_t)(base + (uint64_t)(KUGO_FB_BLOCKS + 1) * ARM_TT_L2_SIZE +
++	    (KUGO_PSTORE_PHYS & (ARM_TT_L2_SIZE - 1)));
+ #elif defined(VINCE)
+ 	early_fb = (volatile uint8_t *)(uintptr_t)(base + 0x1000);
+ #else
+@@ -97,6 +124,9 @@ early_clear_row(void)
+ void
+ sweet_early_putc(char c)
+ {
++#if defined(KUGO)
++	kugo_plog_putc(c);
++#endif
+ 	if (early_disabled) {
+ 		return;
+ 	}
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+index c8e2fc2..536ea48 100644
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -14,6 +14,9 @@ void vince_early_exception(uint64_t esr, uint64_t far, uint64_t elr);
+ void sweet_early_panic(const char *fmt, va_list *args);
+ void sweet_early_relocate(uint64_t base);
+ void sweet_early_disable(void);
++#if defined(KUGO)
++void kugo_plog_putc(char c);
++#endif
+ #else
+ static inline void sweet_early_mark(unsigned int stage, const char *label)
+ {
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 0ff2340..e922e48 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -724,6 +724,8 @@ static uint32_t fbcon_width, fbcon_height, fbcon_stride;
+ static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
+ 
+ #if defined(KUGO)
++extern void kugo_plog_putc(char c);
++
+ /* Command-mode panel (see VINCE.h): each finished line goes out as one MDP frame. */
+ static volatile uint8_t *fbcon_mdss;
+ 
+@@ -788,6 +790,9 @@ fbcon_transmit_ready(void)
+ static void
+ fbcon_transmit_data(uint8_t c)
+ {
++#if defined(KUGO)
++	kugo_plog_putc((char)c);
++#endif
+ 	if (c == '\r') {
+ 		fbcon_col = 0;
+ 		return;
+diff --git a/pexpert/pexpert/arm64/VINCE.h b/pexpert/pexpert/arm64/VINCE.h
+index 4e616d4..289a45d 100644
+--- a/pexpert/pexpert/arm64/VINCE.h
++++ b/pexpert/pexpert/arm64/VINCE.h
+@@ -73,4 +73,13 @@
+  */
+ #define KUGO_CTL_PAGE_PHYS        0x8fff0000
+ 
++/*
++ * Kernel console mirror: ramoops dump record 0 (live DT ramoops@57f00000, record 128 KiB, no ECC,
++ * "DBGC" header). The shim's log is already there; kernel output is appended, and after the watchdog
++ * reset Android shows both as /sys/fs/pstore/dmesg-ramoops-0.
++ */
++#define KUGO_PSTORE_PHYS          0x57f00000
++#define KUGO_PSTORE_SIZE          0x20000
++#define KUGO_PSTORE_SIG           0x43474244
++
+ #endif /* ! _PEXPERT_ARM64_VINCE_H */
