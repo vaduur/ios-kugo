@@ -112,11 +112,12 @@ def build_kugo_adt(seed=None):
         ('canvas-height', u32(2436)),
     ])
 
+    # No 'interrupts': vince_mmc.c polls, and without an interrupt-parent IOKit walks up to the root
+    # looking for #interrupt-cells and loops on "unexpected IODeviceTreeSupport.cpp:579".
     sdhci_node = node('sdhci', [
         ph(),
         ('compatible', cstr('generic-sdhci') + cstr('qcom,sdhci-msm-v4') + b'\0'),
         ('reg', u64(SDHCI, SDHCI_SIZE)),
-        ('interrupts', u32(0, 123, 4)),
     ])
 
     # Stub nubs so MobileGestalt finds WifiAddress/BluetoothAddress (see mkadt_vince.py).
@@ -191,9 +192,12 @@ def build_kugo_adt(seed=None):
 
     pram = node('pram', [ph(), ('reg', u64(panic_base, PANIC_LOG_SIZE))])
 
+    # 'xiaomi,vince' is what the vince kernel's SweetPlatformExpert matches (KernelConfigTables.cpp);
+    # without it: panic "Unable to find driver for this platform".
     root = node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('sony,kugo') + cstr('qcom,msm8956') + cstr('AppleARM') + b'\0'),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('sony,kugo') + cstr('xiaomi,vince') +
+         cstr('qcom,msm8956') + cstr('AppleARM') + b'\0'),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('kugo')),
         ('target-sub-type', cstr('kugo')),
