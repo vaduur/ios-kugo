@@ -1,0 +1,376 @@
+diff --git a/bsd/dev/vince_ctl.c b/bsd/dev/vince_ctl.c
+index 0e6d4cd..f19da02 100644
+--- a/bsd/dev/vince_ctl.c
++++ b/bsd/dev/vince_ctl.c
+@@ -20,7 +20,12 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void vince_ctl_start(void);
+ 
++#include <pexpert/arm64/board_config.h>
++#if defined(KUGO)
++#define CTL_PAGE_PA     KUGO_CTL_PAGE_PHYS     /* 0x913F0000 is inside kugo's XNU RAM */
++#else
+ #define CTL_PAGE_PA     0x913F0000u
++#endif
+ #define CTL_WORD        0xff8u
+ #define CTL_HALT        0x48414c54u     /* 'HALT', written by the shim */
+ #define CTL_SEEN        0x5345454eu     /* 'SEEN', written back here */
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index ea033f3..e2c3625 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -91,7 +91,7 @@ extern "C" boolean_t PE_parse_boot_argn(const char *arg_string, void *arg_ptr, i
+  * (Corner 2 ceiling is 860 mV).
+  * Switch both Cluster 0 (0x0b111050) and Cluster 1 (0x0b011050) to APCS A53 PLL (0x501).
+  */
+-static void
++static void __unused
+ vince_cpu_clock_init(void)
+ {
+ 	uint32_t target_mhz = 1401;
+@@ -288,8 +288,13 @@ SweetCPU::start(IOService *provider)
+ 
+ #if defined(VINCE)
+ 	if (boot) {
++#if defined(KUGO)
++		/* MSM8956 clusters (A53 / A72) have their own PLLs and muxes; leave LK's clocks alone. */
++		vm_offset_t marks = ml_io_map(KUGO_CTL_PAGE_PHYS, 0x1000);
++#else
+ 		vince_cpu_clock_init();
+ 		vm_offset_t marks = ml_io_map(0x913F0000, 0x1000);
++#endif
+ 		if (marks) {
+ 			for (int i = 0; i < 8; i++) {
+ 				((volatile uint64_t *)marks)[0x100 + i] = 0;
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 4ccbe44..d9223a1 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1841,7 +1841,10 @@ sweet_early_map_final(void)
+ 	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
+ 	assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+-#if defined(VINCE)
++#if defined(KUGO)
++	const uint64_t fb_phys_base = KUGO_FB_PHYS;
++	const unsigned int fb_num_blocks = KUGO_FB_BLOCKS;
++#elif defined(VINCE)
+ 	const uint64_t fb_phys_base = 0x90000000ULL;
+ 	const unsigned int fb_num_blocks = 4;
+ #else
+@@ -1858,6 +1861,18 @@ sweet_early_map_final(void)
+ 		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+ 		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+ 	}
++#if defined(KUGO)
++	/* Device block for the MDSS registers right after the framebuffer (sweet_early_relocate expects it there). */
++	{
++		vm_map_address_t block_va = va + ((uint64_t)fb_num_blocks * ARM_TT_L2_SIZE);
++		tt_entry_t *slot = &l2[(block_va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
++		assert(*slot == ARM_TTE_EMPTY);
++		*slot = (uint64_t)KUGO_MDSS_PHYS |
++		    ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE) |
++		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	}
++#endif
+ 	__asm__ volatile("dsb ishst" ::: "memory");
+ }
+ #endif
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 8a45fdd..c4c2d98 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -101,9 +101,15 @@
+ 	.text
+ 	.align 12
+ #if defined(VINCE)
++#if defined(KUGO)
++#define VINCE_CTL_PAGE_HI	(KUGO_CTL_PAGE_PHYS >> 16)
++#else
++#define VINCE_CTL_PAGE_HI	0x913f
++#endif
+ /*
+  * SMP progress mark, MMU off only: stage code to PA 0x913F0800 + 8 * core (core = Aff1 * 4 + Aff0), a free word
+  * in the framebuffer carve-out next to the VSCN descriptor; the shim reads it from CPU1 (`r 913f0800 10`).
++ * (KUGO: same offsets in the page at KUGO_CTL_PAGE_PHYS.)
+  * Clobbers x9-x11.
+  */
+ .macro VINCE_SMP_MARK code
+@@ -112,7 +118,7 @@
+ 	ubfx	x9, x9, #8, #8
+ 	add		x10, x10, x9, lsl #2
+ 	movz	x9, #0x0800
+-	movk	x9, #0x913f, lsl #16
++	movk	x9, #VINCE_CTL_PAGE_HI, lsl #16
+ 	add		x9, x9, x10, lsl #3
+ 	mov		x11, #\code
+ 	str		x11, [x9]
+@@ -126,7 +132,7 @@
+ 	ubfx	x9, x9, #8, #8
+ 	add		x10, x10, x9, lsl #2
+ 	movz	x9, #(0x0c00 + 8 * \idx)
+-	movk	x9, #0x913f, lsl #16
++	movk	x9, #VINCE_CTL_PAGE_HI, lsl #16
+ 	add		x9, x9, x10, lsl #6
+ 	str		\reg, [x9]
+ 	dsb		sy
+@@ -581,8 +587,12 @@ start_cpu:
+ .macro VINCE_STAGE_MARK r, g, b, x_start
+ 	/* boot CPU only (x21 = 0): secondaries come through common_start with x21 = their cpu data */
+ 	cbnz	x21, 9f
++#if defined(KUGO)
++	MOV64	x9, (KUGO_FB_PHYS + (KUGO_FB_HEIGHT - 40) * KUGO_FB_STRIDE)
++#else
+ 	movz	x9, #0x4480
+ 	movk	x9, #0x9069, lsl #16
++#endif
+ 	add		x9, x9, #(\x_start * 3)
+ 	mov		x10, #32
+ 1:
+@@ -597,10 +607,30 @@ start_cpu:
+ 	strb	w13, [x12], #1
+ 	subs	x11, x11, #3
+ 	b.ne	2b
++#if defined(KUGO)
++	add		x9, x9, #KUGO_FB_STRIDE
++#else
+ 	add		x9, x9, #3240
++#endif
+ 	subs	x10, x10, #1
+ 	b.ne	1b
+ 	dsb		sy
++#if defined(KUGO)
++	/* Command-mode panel: send the frame (MMU off: PA; V=P: the L1[0] device block below). */
++	MOV64	x9, KUGO_MDSS_PHYS
++	mov		w10, #(1 << KUGO_PP0_DONE_BIT)
++	str		w10, [x9, #KUGO_MDP_INTR_CLEAR]
++	mov		w10, #1
++	str		w10, [x9, #KUGO_CTL0_START]
++	dsb		sy
++	mov		x11, #0x100000
++3:
++	ldr		w10, [x9, #KUGO_MDP_INTR_STATUS]
++	tbnz	w10, #KUGO_PP0_DONE_BIT, 4f
++	subs	x11, x11, #1
++	b.ne	3b
++4:
++#endif
+ 9:
+ .endmacro
+ #endif
+@@ -802,13 +832,23 @@ Lkernelcache_base_found:
+ 	/*
+ 	 * Splash framebuffer: 4x 2MB Normal-NC blocks (8MB total) at 0x90000000 in V=P L2 table.
+ 	 * Covers 1080x2160x3 (6.998MB) from 0x90001000 to 0x906ADA00 without translation faults.
++	 * KUGO: KUGO_FB_BLOCKS blocks at KUGO_FB_PHYS, in the same 1 GiB as the kernel (0x80000000..), so this
++	 * L2 table holds them too.
+ 	 */
++#if defined(KUGO)
++	MOV64	x10, KUGO_FB_PHYS
++#else
+ 	MOV64	x10, 0x90000000
++#endif
+ 	MOV64	x14, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+ 	add		x13, x25, #(2 * PGBYTES)
++#if defined(KUGO)
++	mov		x15, #KUGO_FB_BLOCKS
++#else
+ 	mov		x15, #4
++#endif
+ 1:
+ 	orr		x11, x14, x10
+ 	str		x11, [x13, x12, lsl #TTE_SHIFT]
+@@ -817,6 +857,15 @@ Lkernelcache_base_found:
+ 	subs	x15, x15, #1
+ 	b.ne	1b
+ 
++#if defined(KUGO)
++	/*
++	 * MDSS registers for the command-mode frame kicks once the MMU is on: one 1 GiB device block,
++	 * VA = PA 0..0x3fffffff, in the V=P L1 table (entry 0 is unused, our RAM starts at 0x90000000).
++	 */
++	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
++	str		x11, [x25]
++#endif
++
+ 	/* Stage 0B: green 48x32 band - bootstrap V=P, KVA and FB mapped */
+ 	VINCE_STAGE_MARK 0x00, 0xff, 0x00, 96
+ #elif defined(SWEET)
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index c9effe4..c1c95bf 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -7,7 +7,14 @@
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
+-#if defined(VINCE)
++#if defined(KUGO)
++#include <arm64/proc_reg.h>
++#define EARLY_FB_PHYS ((uint64_t)KUGO_FB_PHYS)
++#define EARLY_WIDTH ((unsigned int)KUGO_FB_WIDTH)
++#define EARLY_HEIGHT ((unsigned int)KUGO_FB_HEIGHT)
++#define EARLY_STRIDE ((unsigned int)KUGO_FB_STRIDE)
++#define EARLY_BPP 3u
++#elif defined(VINCE)
+ #define EARLY_FB_PHYS 0x90001000ULL
+ #define EARLY_WIDTH 1080u
+ #define EARLY_HEIGHT 2160u
+@@ -23,11 +30,33 @@
+ 
+ static volatile uint8_t *early_fb = (volatile uint8_t *)(uintptr_t)EARLY_FB_PHYS;
+ 
++#if defined(KUGO)
++/* MDSS registers: PA (MMU off) / V=P device block (start.s), then the KVA block sweet_early_map_final adds. */
++static volatile uint8_t *early_mdss = (volatile uint8_t *)(uintptr_t)KUGO_MDSS_PHYS;
++
++/* Command-mode panel: send the framebuffer as one frame, see VINCE.h. */
++static void
++kugo_early_kick(void)
++{
++	volatile uint32_t *clear = (volatile uint32_t *)(early_mdss + KUGO_MDP_INTR_CLEAR);
++	volatile uint32_t *status = (volatile uint32_t *)(early_mdss + KUGO_MDP_INTR_STATUS);
++	__asm__ volatile("dsb sy" ::: "memory");
++	*clear = 1u << KUGO_PP0_DONE_BIT;
++	*(volatile uint32_t *)(early_mdss + KUGO_CTL0_START) = 1;
++	__asm__ volatile("dsb sy" ::: "memory");
++	for (unsigned int i = 0; i < 0x100000u && !(*status & (1u << KUGO_PP0_DONE_BIT)); i++) {
++	}
++}
++#endif
++
+ void
+ sweet_early_relocate(uint64_t base)
+ {
+ 	sweet_early_mark(8, "leaving bootstrap TTBR0");
+-#if defined(VINCE)
++#if defined(KUGO)
++	early_fb = (volatile uint8_t *)(uintptr_t)base;
++	early_mdss = (volatile uint8_t *)(uintptr_t)(base + (uint64_t)KUGO_FB_BLOCKS * ARM_TT_L2_SIZE);
++#elif defined(VINCE)
+ 	early_fb = (volatile uint8_t *)(uintptr_t)(base + 0x1000);
+ #else
+ 	early_fb = (volatile uint8_t *)(uintptr_t)base;
+@@ -84,6 +113,9 @@ sweet_early_putc(char c)
+ 		early_row = (early_row + 1) % EARLY_ROWS;
+ 		early_clear_row();
+ 		if (c == '\n') {
++#if defined(KUGO)
++			kugo_early_kick();
++#endif
+ 			return;
+ 		}
+ 	}
+@@ -153,6 +185,9 @@ vince_early_exception(uint64_t esr, uint64_t far, uint64_t elr)
+ 	sweet_early_hex(elr);
+ 	sweet_early_putc('\n');
+ 	__asm__ volatile("dsb sy" ::: "memory");
++#if defined(KUGO)
++	kugo_early_kick();
++#endif
+ }
+ 
+ void
+@@ -203,6 +238,9 @@ sweet_early_panic(const char *fmt, va_list *args)
+ 	va_end(copy);
+ 	sweet_early_putc('\n');
+ 	__asm__ volatile("dsb sy" ::: "memory");
++#if defined(KUGO)
++	kugo_early_kick();
++#endif
+ }
+ 
+ void
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index f6a7968..0ff2340 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -723,6 +723,26 @@ static volatile uint8_t *fbcon_base;
+ static uint32_t fbcon_width, fbcon_height, fbcon_stride;
+ static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
+ 
++#if defined(KUGO)
++/* Command-mode panel (see VINCE.h): each finished line goes out as one MDP frame. */
++static volatile uint8_t *fbcon_mdss;
++
++static void
++fbcon_kick(void)
++{
++	if (fbcon_mdss == NULL) {
++		return;
++	}
++	volatile uint32_t *status = (volatile uint32_t *)(fbcon_mdss + KUGO_MDP_INTR_STATUS);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(fbcon_mdss + KUGO_MDP_INTR_CLEAR) = 1u << KUGO_PP0_DONE_BIT;
++	*(volatile uint32_t *)(fbcon_mdss + KUGO_CTL0_START) = 1;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (unsigned int i = 0; i < 0x100000u && !(*status & (1u << KUGO_PP0_DONE_BIT)); i++) {
++	}
++}
++#endif
++
+ static void
+ fbcon_clear_row(uint32_t row)
+ {
+@@ -743,6 +763,9 @@ fbcon_newline(void)
+ 	fbcon_row = (fbcon_row + 1) % fbcon_rows;
+ 	fbcon_clear_row(fbcon_row);
+ 	fbcon_clear_row((fbcon_row + 1) % fbcon_rows);
++#if defined(KUGO)
++	fbcon_kick();
++#endif
+ }
+ 
+ static void
+@@ -846,6 +869,9 @@ fbcon_probe(void)
+ 		return;
+ 	}
+ 	fbcon_base = (volatile uint8_t *)ml_io_map_wcomb(reg[0], reg[1]);
++#if defined(KUGO)
++	fbcon_mdss = (volatile uint8_t *)ml_io_map(KUGO_MDSS_PHYS, 0x3000);
++#endif
+ 	if (fbcon_base != NULL) {
+ 		register_serial_functions(&vince_fbcon_serial_functions);
+ 	}
+diff --git a/pexpert/pexpert/arm64/VINCE.h b/pexpert/pexpert/arm64/VINCE.h
+index e008bb3..4e616d4 100644
+--- a/pexpert/pexpert/arm64/VINCE.h
++++ b/pexpert/pexpert/arm64/VINCE.h
+@@ -43,4 +43,34 @@
+ #define MSM8953_GICD_BASE         0x0b000000ULL
+ #define MSM8953_GICC_BASE         0x0b002000ULL
+ 
++/*
++ * iSony fork: this vince kernel runs on the Sony Xperia X Compact ("kugo", MSM8956: 4x Cortex-A53 +
++ * 2x Cortex-A72, GICv2 at the same addresses). Everything vince applies; KUGO marks what differs.
++ * No ULL suffixes: start.s uses these too.
++ */
++#define KUGO                      1
++
++/* LK's splash buffer when it boots the recovery slot: 720x1280, 24 bpp (bytes B, G, R), stride 2160. */
++#define KUGO_FB_PHYS              0x83200000
++#define KUGO_FB_WIDTH             720
++#define KUGO_FB_HEIGHT            1280
++#define KUGO_FB_STRIDE            2160
++#define KUGO_FB_BLOCKS            2               // 2 MiB L2 blocks covering it
++
++/*
++ * Command-mode DSI panel: nothing reaches the screen until MDP CTL0 START sends a frame. Kick after
++ * drawing; wait for PING_PONG_0_DONE so a START never lands mid-transfer (that desyncs the panel).
++ */
++#define KUGO_MDSS_PHYS            0x01a00000
++#define KUGO_MDP_INTR_STATUS      0x1014
++#define KUGO_MDP_INTR_CLEAR       0x1018
++#define KUGO_PP0_DONE_BIT         8
++#define KUGO_CTL0_START           0x201c
++
++/*
++ * vince's shim-visible page (SMP marks, halt word) sits at PA 0x913F0000, outside vince's XNU RAM
++ * (0xa0000000+) but inside ours (0x90000000..0xd3c00000). Use the last page below our RAM instead.
++ */
++#define KUGO_CTL_PAGE_PHYS        0x8fff0000
++
+ #endif /* ! _PEXPERT_ARM64_VINCE_H */
