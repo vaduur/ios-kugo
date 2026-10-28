@@ -1,0 +1,16 @@
+diff --git a/bsd/dev/vince_input.c b/bsd/dev/vince_input.c
+index 881c3c5..b5710b1 100644
+--- a/bsd/dev/vince_input.c
++++ b/bsd/dev/vince_input.c
+@@ -56,7 +56,11 @@ extern void vince_adreno_init(void);
+ #define NO_APID         0xffffu
+ 
+ #define TLMM_PA         0x01000000u
++#if defined(KUGO)
++#define TLMM_SIZE       0x92000u        /* 145 GPIOs: volume up is GPIO 130 */
++#else
+ #define TLMM_SIZE       0x56000u
++#endif
+ #define GPIO_CTL(n)     ((uint32_t)(n) * 0x1000u)
+ #define GPIO_IO(n)      (GPIO_CTL(n) + 4u)
+ #if defined(KUGO)
