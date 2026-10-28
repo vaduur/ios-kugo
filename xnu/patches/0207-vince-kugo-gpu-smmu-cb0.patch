@@ -1,0 +1,59 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index dcbf952..5faf5d2 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -489,9 +489,51 @@ smmu_identity(vm_offset_t smmu)
+ 		printf("SWEET GPU: SMMU CB0 already translating, not ours: stop\n");
+ 		return false;
+ 	}
+-	g_smmu_bypass = true;
+-	printf("SWEET GPU: SMMU CB0 off: GPU addresses are physical (bypass)\n");
+-	return true;
++	/*
++	 * In the bypass the CP ran but read garbage (opcode error, no CP_MEM_WRITE, gpu-xnu9): downstream
++	 * KGSL on this SoC always translates through CB0, whose registers the normal world programs.
++	 * kugosmmu=1 (default): AArch32 LPAE format (the DT asks for 3-level tables), 32-bit VA;
++	 * kugosmmu=2: AArch64 format as ios-sailfish; kugosmmu=0: stay in the bypass.
++	 * Either way an identity map of DRAM 0x40000000-0xffffffff in 1 GB blocks (same L1 descriptors).
++	 */
++	int mode = 1;
++	(void)PE_parse_boot_argn("kugosmmu", &mode, sizeof(mode));
++	if (mode == 0) {
++		g_smmu_bypass = true;
++		printf("SWEET GPU: SMMU CB0 off: GPU addresses are physical (bypass)\n");
++		return true;
++	}
++	vm_offset_t pt_va;
++	uint64_t pt = gpu_page(&pt_va);
++	if (pt == 0) {
++		return false;
++	}
++	uint64_t *l1 = (uint64_t *)pt_va;
++	g_l1 = l1;
++	g_l1_pa = pt;
++	for (uint64_t gb = 1; gb < 4; gb++) {
++		l1[gb] = (gb << 30) | 1u | (1u << 6) | (2u << 8) | (1u << 10);     /* block, attr 0, AP[1], outer, AF */
++	}
++	flush_dcache64((addr64_t)pt, PAGE_SIZE, TRUE);
++	wr(cb, 0x0, 0);                                 /* SCTLR off while configuring */
++	if (mode == 2) {
++		wr(cb, 0x10, (7u << 15) | 1u);          /* TCR2: SEP upstream, PASIZE 36 bit */
++		wr(cb, 0x30, 28u | (1u << 23));         /* TCR: T0SZ 28, TG0 4K, walks NC, EPD1 */
++	} else {
++		wr(cb, 0x30, (1u << 31) | (2u << 12) | (1u << 23));     /* TTBCR: EAE, T0SZ 0, SH0 outer, EPD1 */
++	}
++	wr(cb, 0x38, 0x44u);                            /* MAIR0: attr0 normal non-cacheable */
++	wr(cb, 0x20, (uint32_t)pt);                     /* TTBR0, ASID 0 */
++	wr(cb, 0x24, (uint32_t)(pt >> 32));
++	wr(cb, 0x58, 0xffffffffu);                      /* FSR: clear */
++	wr(cb, 0x0, (1u << 2) | (1u << 1) | 1u);        /* AFE TRE M (faults terminate, recorded) */
++	wr(cb, 0x618, 0);                               /* CB_TLBIALL */
++	wr(cb, 0x7f0, 0);                               /* CB_TLBSYNC */
++	bool synced = poll(cb, 0x7f4, 1u, 0, 10);
++	printf("SWEET GPU: SMMU CB0 %s identity: pt %llx SCTLR %08x TCR %08x TCR2 %08x TTBR0 %08x MAIR0 %08x sync %d\n",
++	    mode == 2 ? "AArch64" : "LPAE", pt, rd(cb, 0x0), rd(cb, 0x30), rd(cb, 0x10), rd(cb, 0x20), rd(cb, 0x38),
++	    synced);
++	return (rd(cb, 0x0) & 1u) && rd(cb, 0x20) == (uint32_t)pt;
+ }
+ #define smmu_identity smmu_identity_pixel
+ #endif
