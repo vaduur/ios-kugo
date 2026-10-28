@@ -1,0 +1,52 @@
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index fb5cfab..2ee1123 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -55,9 +55,16 @@ kugo_early_kick(void)
+ static volatile uint8_t *early_plog = (volatile uint8_t *)(uintptr_t)KUGO_PSTORE_PHYS;
+ 
+ /*
+- * Append to the console mirror. The record is a ring, as ramoops reads every zone (header: signature,
+- * start = next write, size = valid bytes; Android unwraps it in order), so the latest output survives.
++ * Append to the console mirror (ramoops dump record: signature, start, size, data). TWRP's kernel drops
++ * a dmesg record whose data does not begin with the shim's "====1.0-D" header, so ramoops' own ring
++ * (start != 0) cannot be used: start stays 0 and the data is linear. The first KUGO_PLOG_KEEP bytes
++ * (header, shim, early boot) are kept; past the end the writes wrap to KUGO_PLOG_KEEP, and a NUL after
++ * the last character marks the cursor (tools/plog_unwrap.py puts the pieces back in order).
+  */
++#define KUGO_PLOG_KEEP 0x8000u
++static uint32_t kugo_plog_pos;
++static bool kugo_plog_started;
++
+ /*
+  * Once secondary CPUs run (SweetCPU calls kugo_plog_smp_on before the first PSCI CPU_ON) several cores
+  * write here at once; a torn header (start > size) makes ramoops drop the whole record. From then on the
+@@ -92,13 +99,23 @@ kugo_plog_putc(char c)
+ 		hdr[2] = 0;
+ 		hdr[0] = KUGO_PSTORE_SIG;
+ 	}
+-	uint32_t pos = hdr[1], size = hdr[2];
+-	if (pos >= cap) {
+-		pos = 0;
++	if (!kugo_plog_started) {
++		kugo_plog_started = true;
++		kugo_plog_pos = hdr[2] < cap ? hdr[2] : cap;    /* after the shim's lines */
++	}
++	uint32_t pos = kugo_plog_pos, size = hdr[2];
++	bool wrapped = pos >= cap;
++	if (wrapped) {
++		pos = KUGO_PLOG_KEEP;
+ 	}
+ 	early_plog[12 + pos] = (uint8_t)c;
+-	hdr[1] = pos + 1 < cap ? pos + 1 : 0;
+-	hdr[2] = size < cap ? size + 1 : cap;
++	pos++;
++	if (wrapped || size >= cap) {
++		early_plog[12 + (pos < cap ? pos : KUGO_PLOG_KEEP)] = 0;   /* cursor mark */
++	}
++	kugo_plog_pos = pos;
++	hdr[1] = 0;
++	hdr[2] = pos > size ? pos : size;
+ 	if (c == '\n') {
+ 		__asm__ volatile("dsb sy" ::: "memory");
+ 	}
