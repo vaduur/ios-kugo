@@ -1,0 +1,69 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 5faf5d2..6d4c9ae 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -716,6 +716,7 @@ struct zap_phdr {
+ #if defined(KUGO)
+ /* A510 has no zap shader (mainline adreno catalog): leave secure mode directly, as mainline does. */
+ static vm_offset_t g_gpu_regs;
++static int g_kugocp;
+ static bool
+ zap_load(void)
+ {
+@@ -2121,6 +2122,28 @@ cp_test(vm_offset_t gpu, int level)
+ 	 */
+ #if defined(KUGO)
+ 	g_gpu_regs = gpu;
++	/*
++	 * kugocp bits (default 1): 1 = mainline a5xx_pm_resume for A505..A512 (RBBM_CLOCK_CNTL 0x55, HWCG
++	 * off: CLOCK_CNTL 0, ISDB_CNT 0x180); 2 = CP_ME_INIT workaround word 0 instead of A510's 1;
++	 * 4 = RBBM software reset first.
++	 */
++	int kcp = 1;
++	(void)PE_parse_boot_argn("kugocp", &kcp, sizeof(kcp));
++	g_kugocp = kcp;
++	if (kcp & 4) {
++		gw(gpu, 0x0043, 1);                     /* RBBM_SW_RESET_CMD */
++		(void)gr(gpu, 0x0043);
++		delay(100);
++		gw(gpu, 0x0043, 0);
++		delay(100);
++	}
++	if (kcp & 1) {
++		gw(gpu, 0x0067, 0x55);                  /* RBBM_CLOCK_CNTL: halt sp_input_clk */
++		gw(gpu, 0x0067, 0);                     /* HWCG off */
++		gw(gpu, 0x0533, 0x180);                 /* RBBM_ISDB_CNT */
++	}
++	printf("SWEET GPU: kugocp %d: RBBM_CLOCK_CNTL %08x ISDB %08x RBBM_STATUS %08x\n", kcp, gr(gpu, 0x0067),
++	    gr(gpu, 0x0533), gr(gpu, R_RBBM_STATUS));
+ 	/* A510: no GPMU islands (mainline a5xx_pm_resume returns early) */
+ 	bool rbccu = true, sp = true;
+ 	if (0) {
+@@ -2207,7 +2230,7 @@ cp_test(vm_offset_t gpu, int level)
+ 	emit(0);
+ 	emit(0);
+ #if defined(KUGO)
+-	emit(0x1);              /* A510 token and syncs workaround (mainline a5xx_me_init) */
++	emit((g_kugocp & 2) ? 0x0 : 0x1);       /* A510 token and syncs workaround (mainline a5xx_me_init) */
+ #else
+ 	emit(0xb);              /* A530 token-end-sync workaround */
+ #endif
+@@ -2229,11 +2252,13 @@ cp_test(vm_offset_t gpu, int level)
+ #if defined(KUGO)
+ 	{
+ 		/* mainline a5xx_cp_err_irq: the opcode the PFP choked on (printed always: the status bit did not hold) */
+-		gw(gpu, 0x0b0c, 0);                     /* CP_PFP_STAT_ADDR */
+-		uint32_t d0 = gr(gpu, 0x0b0d);          /* CP_PFP_STAT_DATA */
+-		uint32_t d1 = gr(gpu, 0x0b0d);
+-		printf("SWEET GPU: CP opcode error: PFP stat %08x %08x; ME ucode %08x %08x, PFP ucode %08x %08x\n",
+-		    d0, d1, ((volatile uint32_t *)phystokv(pm4))[0], ((volatile uint32_t *)phystokv(pm4))[1],
++		gw(gpu, 0x0808, 0);                     /* CP_PFP_STAT_ADDR */
++		uint32_t d0 = gr(gpu, 0x0809);          /* CP_PFP_STAT_DATA, indexed: index 1 = the opcode */
++		uint32_t d1 = gr(gpu, 0x0809);
++		gw(gpu, 0x081a, 0);                     /* CP_ME_STAT_ADDR */
++		uint32_t m0 = gr(gpu, 0x0b14), m1 = gr(gpu, 0x0b14);
++		printf("SWEET GPU: CP_INT %08x: PFP stat %08x %08x (opcode), ME stat %08x %08x; ME ucode %08x %08x, PFP ucode %08x %08x\n",
++		    gr(gpu, R_CP_INTERRUPT_STATUS), d0, d1, m0, m1, ((volatile uint32_t *)phystokv(pm4))[0], ((volatile uint32_t *)phystokv(pm4))[1],
+ 		    ((volatile uint32_t *)phystokv(pfp))[0], ((volatile uint32_t *)phystokv(pfp))[1]);
+ 		printf("SWEET GPU: ring %08x %08x %08x %08x %08x %08x %08x %08x %08x | %08x %08x %08x %08x %08x\n",
+ 		    rb[0], rb[1], rb[2], rb[3], rb[4], rb[5], rb[6], rb[7], rb[8], rb[9], rb[10], rb[11], rb[12], rb[13]);
