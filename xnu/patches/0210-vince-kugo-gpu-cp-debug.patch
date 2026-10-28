@@ -1,0 +1,69 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 9a68be6..19ebfe0 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2125,7 +2125,7 @@ cp_test(vm_offset_t gpu, int level)
+ 	/*
+ 	 * kugocp bits (default 1): 1 = mainline a5xx_pm_resume for A505..A512 (RBBM_CLOCK_CNTL 0x55, HWCG
+ 	 * off: CLOCK_CNTL 0, ISDB_CNT 0x180); 2 = CP_ME_INIT workaround word 0 instead of A510's 1;
+-	 * 4 = RBBM software reset first.
++	 * 4 = RBBM software reset first; 8 = a CP_SCRATCH1 register write ahead of the ME_INIT.
+ 	 */
+ 	int kcp = 1;
+ 	(void)PE_parse_boot_argn("kugocp", &kcp, sizeof(kcp));
+@@ -2223,6 +2223,18 @@ cp_test(vm_offset_t gpu, int level)
+ 	cp_state(gpu, "before ME start:");
+ 
+ 	rb_n = 0;
++#if defined(KUGO)
++	/*
++	 * Register writes need no memory access, so they tell the CP's ring parsing apart from its memory
++	 * writes: CP_SCRATCH0 after the ME_INIT, CP_SCRATCH1 before it (kugocp bit 8).
++	 */
++	gw(gpu, 0x0b78, 0);
++	gw(gpu, 0x0b79, 0);
++	if (g_kugocp & 8) {
++		emit(pkt4(0x0b79, 1));
++		emit(0xc0ffee03);
++	}
++#endif
+ 	emit(pkt7(CP_ME_INIT, 8));
+ 	emit(0x2f);
+ 	emit(0x3);
+@@ -2236,6 +2248,10 @@ cp_test(vm_offset_t gpu, int level)
+ #endif
+ 	emit(0);
+ 	emit(0);
++#if defined(KUGO)
++	emit(pkt4(0x0b78, 1));
++	emit(0xc0ffee02);
++#endif
+ 	emit(pkt7(CP_MEM_WRITE, 3));
+ 	emit((uint32_t)scratch);
+ 	emit((uint32_t)(scratch >> 32));
+@@ -2262,6 +2278,25 @@ cp_test(vm_offset_t gpu, int level)
+ 		    ((volatile uint32_t *)phystokv(pfp))[0], ((volatile uint32_t *)phystokv(pfp))[1]);
+ 		printf("SWEET GPU: ring %08x %08x %08x %08x %08x %08x %08x %08x %08x | %08x %08x %08x %08x %08x\n",
+ 		    rb[0], rb[1], rb[2], rb[3], rb[4], rb[5], rb[6], rb[7], rb[8], rb[9], rb[10], rb[11], rb[12], rb[13]);
++		printf("SWEET GPU: CP_SCRATCH0 %08x (after ME_INIT, want c0ffee02) CP_SCRATCH1 %08x (before, kugocp&8: c0ffee03)\n",
++		    gr(gpu, 0x0b78), gr(gpu, 0x0b79));
++		/*
++		 * What the CP holds: the ucode it loaded from INSTR_BASE (vs the blob's first words above) and
++		 * the ring words it fetched into the ROQ/MEQ. Zeros there = its memory reads return zeros.
++		 */
++		static const struct { uint16_t addr, data; const char *name; } dbg[] = {
++			{ 0x082a, 0x082b, "PFP ucode" }, { 0x082f, 0x0830, "ME ucode" },
++			{ 0x0821, 0x0822, "ROQ" }, { 0x0823, 0x0824, "MEQ" },
++		};
++		for (unsigned i = 0; i < sizeof(dbg) / sizeof(dbg[0]); i++) {
++			uint32_t w[8];
++			for (unsigned j = 0; j < 8; j++) {
++				gw(gpu, dbg[i].addr, j);
++				w[j] = gr(gpu, dbg[i].data);
++			}
++			printf("SWEET GPU: %-9s %08x %08x %08x %08x %08x %08x %08x %08x\n", dbg[i].name,
++			    w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++		}
+ 	}
+ #endif
+ 	smmu_faults(smmu, "after ring:");
