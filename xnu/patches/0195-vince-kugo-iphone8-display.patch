@@ -1,0 +1,83 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6b01829..4608a36 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -78,8 +78,21 @@ enum {
+  * centered 1080x2400 part of it is shown on the 1080x2400 panel.
+  * Boot-arg sweetfb_native=1 presents the real panel size instead.
+  */
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++#include <pexpert/arm64/board_config.h>
++#endif
++#if defined(KUGO)
++/*
++ * kugo: present the iPhone 8 panel, 750x1334 (375x667 points @2x, ADT display-scale 2), as ios-sailfish
++ * does: 2.7 times fewer pixels for the CPU renderer than 1125x2436, and the same aspect as the 720x1280
++ * panel, so it fills the whole screen.
++ */
++#define SWEET_FB_LOGICAL_W              750
++#define SWEET_FB_LOGICAL_H              1334
++#else
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
++#endif
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
+ class IOMobileFramebuffer : public IOService {
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index eec8482..1abd2ad 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -359,7 +359,9 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+ #include <pexpert/arm64/board_config.h>
+ #endif
+ #if defined(KUGO)
+-/* kugo: 720x1280 panel showing 1125x2436 scaled into 592x1280 at column 64 (SweetFramebuffer.cpp) */
++/* kugo: 720x1280 panel showing the presented 750x1334 display scaled to the full panel (SweetFramebuffer.cpp) */
++#define SWEET_TOUCH_LOGICAL_W 750
++#define SWEET_TOUCH_LOGICAL_H 1334
+ #define SWEET_TOUCH_PANEL_W 720
+ #define SWEET_TOUCH_PANEL_H 1280
+ #define SWEET_TOUCH_EDGE_PX 32
+@@ -371,6 +373,10 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+ #else
+ #define SWEET_TOUCH_PANEL_H 2400
+ #endif
++#ifndef SWEET_TOUCH_LOGICAL_W
++#define SWEET_TOUCH_LOGICAL_W 1125
++#define SWEET_TOUCH_LOGICAL_H 2436
++#endif
+ #ifndef SWEET_TOUCH_PANEL_W
+ #define SWEET_TOUCH_PANEL_W 1080
+ #define SWEET_TOUCH_EDGE_PX 48
+@@ -456,8 +462,8 @@ SweetHIDTouch::start(IOService *provider)
+ 	}
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? SWEET_TOUCH_PANEL_W : 1125;
+-	fLogicalH = native ? SWEET_TOUCH_PANEL_H : 2436;
++	fLogicalW = native ? SWEET_TOUCH_PANEL_W : SWEET_TOUCH_LOGICAL_W;
++	fLogicalH = native ? SWEET_TOUCH_PANEL_H : SWEET_TOUCH_LOGICAL_H;
+ 	fOffX = (fLogicalW - SWEET_TOUCH_PANEL_W) / 2;
+ 	fOffY = (fLogicalH - SWEET_TOUCH_PANEL_H) / 2;
+ 	fMinX = 0;
+@@ -466,8 +472,8 @@ SweetHIDTouch::start(IOService *provider)
+ 	int crop = 0;
+ 	PE_parse_boot_argn("vincefb_crop", &crop, sizeof(crop));
+ 	if (!native && !crop) {
+-		/* SweetFramebuffer.cpp shows 1125x2436 scaled into 1000x2160 at column 40: undo exactly that */
+-		int outW = ((1125 * SWEET_TOUCH_PANEL_H + 2436 / 2) / 2436 + 4) & ~7;
++		/* SweetFramebuffer.cpp shows the presented display scaled to the panel height (vince: 1000x2160 at column 40): undo exactly that */
++		int outW = ((SWEET_TOUCH_LOGICAL_W * SWEET_TOUCH_PANEL_H + SWEET_TOUCH_LOGICAL_H / 2) / SWEET_TOUCH_LOGICAL_H + 4) & ~7;
+ 		int fill = 0;
+ 		PE_parse_boot_argn("vincefb_fill", &fill, sizeof(fill));
+ 		if (outW > SWEET_TOUCH_PANEL_W || fill) {
+@@ -506,7 +512,7 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+-	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
++	/* Panel pixels -> the presented display (SweetFramebuffer.cpp). */
+ 	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+ 	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);

@@ -84,7 +84,9 @@ def build_kugo_adt(seed=None, product_from=None, ncpus=1):
         ('dram-size', u64(mem_size)),
         ('random-seed', seed),
         ('debug-enabled', u32(1)),
-        ('display-scale', u32(3)),
+        # MobileGestalt's screen scale; with the 750x1334 canvas below iOS sees an iPhone 8 panel (375x667 @2x),
+        # as ios-sailfish does: far less to render on the CPU, same aspect as the 720x1280 panel.
+        ('display-scale', u32(2)),
         ('display-rotation', u32(0)),
         ('unique-chip-id', u64(KUGO_ECID)),
         ('chip-id', u32(0x8015)),  # Apple A11 (iPhone X), the userland we run
@@ -120,8 +122,8 @@ def build_kugo_adt(seed=None, product_from=None, ncpus=1):
         ph(),
         ('device_type', cstr('display-subsystem')),
         ('compatible', cstr('kugo,display') + cstr('vince,display') + cstr('sweet,display') + b'\0'),
-        ('canvas-width', u32(1125)),
-        ('canvas-height', u32(2436)),
+        ('canvas-width', u32(750)),     # SweetFramebuffer.cpp SWEET_FB_LOGICAL_W/H (KUGO)
+        ('canvas-height', u32(1334)),
     ])
 
     # No 'interrupts': vince_mmc.c polls, and without an interrupt-parent IOKit walks up to the root
