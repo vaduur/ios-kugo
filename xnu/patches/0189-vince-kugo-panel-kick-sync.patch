@@ -1,0 +1,53 @@
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 1b53aff..5995c8e 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -729,12 +729,13 @@ extern void kugo_plog_putc(char c);
+ /*
+  * Command-mode panel (see VINCE.h): a frame only reaches the screen when CTL0 START sends it. Every
+  * sender (fbcon after each line, AppleCLCD after each present) goes through kugo_panel_kick(), which
+- * runs with interrupts off and starts a frame only once the previous one signalled PING_PONG_0_DONE:
+- * a START mid-transfer desyncs the panel. kugoar=N instead turns on MDP autorefresh (a frame every
++ * runs with interrupts off and returns only once its frame signalled PING_PONG_0_DONE: a START
++ * mid-transfer desyncs the panel for good (MDP keeps reporting done, the screen never changes again),
++ * and the bootstrap console's own kick (sweet_early.c) knows nothing about frames in flight. kugoar=N instead turns on MDP autorefresh (a frame every
+  * N tear-check vsyncs) and the kicks become no-ops.
+  */
+ static volatile uint8_t *fbcon_mdss;
+-static uint32_t kugo_kick_inflight, kugo_kick_timeouts, kugo_autorefresh;
++static uint32_t kugo_kick_timeouts, kugo_autorefresh;
+ 
+ #define KUGO_MDSS_REG(off) (*(volatile uint32_t *)(fbcon_mdss + (off)))
+ 
+@@ -792,22 +793,19 @@ kugo_panel_kick(void)
+ 		ml_set_interrupts_enabled(istate);
+ 		return;
+ 	}
+-	if (kugo_kick_inflight) {
+-		volatile uint32_t *status = (volatile uint32_t *)(fbcon_mdss + KUGO_MDP_INTR_STATUS);
+-		for (unsigned int i = 0; i < 0x100000u && !(*status & (1u << KUGO_PP0_DONE_BIT)); i++) {
+-		}
+-		if (!(*status & (1u << KUGO_PP0_DONE_BIT))) {
+-			kugo_kick_timeouts++;
+-			if (kugo_kick_timeouts <= 3 || (kugo_kick_timeouts & 0xff) == 0) {
+-				kugo_panel_dump("kick timeout");
+-			}
+-		}
+-	}
++	volatile uint32_t *status = (volatile uint32_t *)(fbcon_mdss + KUGO_MDP_INTR_STATUS);
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	KUGO_MDSS_REG(KUGO_MDP_INTR_CLEAR) = 1u << KUGO_PP0_DONE_BIT;
+ 	KUGO_MDSS_REG(KUGO_CTL0_START) = 1;
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+-	kugo_kick_inflight = 1;
++	for (unsigned int i = 0; i < 0x100000u && !(*status & (1u << KUGO_PP0_DONE_BIT)); i++) {
++	}
++	if (!(*status & (1u << KUGO_PP0_DONE_BIT))) {
++		kugo_kick_timeouts++;
++		if (kugo_kick_timeouts <= 3 || (kugo_kick_timeouts & 0xff) == 0) {
++			kugo_panel_dump("kick timeout");
++		}
++	}
+ 	ml_set_interrupts_enabled(istate);
+ }
+ 
