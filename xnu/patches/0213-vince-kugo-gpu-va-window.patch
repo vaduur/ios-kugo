@@ -1,0 +1,130 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 8f4ad0b..081d213 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -532,7 +532,7 @@ smmu_identity(vm_offset_t smmu)
+ 	uint64_t *l1 = (uint64_t *)pt_va;
+ 	g_l1 = l1;
+ 	g_l1_pa = pt;
+-	for (uint64_t gb = 1; gb < 4; gb++) {
++	for (uint64_t gb = 2; gb < 4; gb++) {       /* GB 0-1: the GPU VA window (vm_init) */
+ 		l1[gb] = (gb << 30) | 1u | (1u << 6) | (2u << 8) | (1u << 10);     /* block, attr 0, AP[1], outer, AF */
+ 	}
+ 	flush_dcache64((addr64_t)pt, PAGE_SIZE, TRUE);
+@@ -923,9 +923,22 @@ blit_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t sc
+  * Mesa makes thousands of small buffers, whole 2 MB chunks ran out at 4096.
+  * g_owner[page] is the mapping index (0 free, VM_GUARD padding).
+  */
+-#define GVA_BASE        0x200000000ull
+-#define GVA_CHUNKS      4096u                   /* 8 GB / 2 MB */
+-#define GVA_PAGES       ((uint32_t)((8ull << 30) / PAGE_SIZE))
++#if defined(KUGO)
++/*
++ * kugo's CB0 runs the AArch32 LPAE format: 32-bit GPU VAs, L1 = 4 x 1 GB. XNU's memory (0x90000000-
++ * 0xd3c00000), the framebuffer and the payload blobs sit in GB 2-3, identity mapped; the window takes
++ * GB 0-1 (VA 0-2 GB, page 0 never handed out: VA 0 is the error return).
++ */
++#define GVA_L1          0u
++#define GVA_GB          2u
++#else
++#define GVA_L1          8u
++#define GVA_GB          8u
++#endif
++#define GVA_BASE        ((uint64_t)GVA_L1 << 30)
++#define GVA_CHUNKS      (GVA_GB * 512u)         /* 2 MB each */
++#define GVA_PAGES       ((uint32_t)(((uint64_t)GVA_GB << 30) / PAGE_SIZE))
++#define GVA_IN(va)      ((uint64_t)(va) - GVA_BASE < (uint64_t)GVA_PAGES * PAGE_SIZE)  /* wraps below the base */
+ #define VM_MAPS         16384u                  /* index 0 unused */
+ #define VM_GUARD        0xffffu
+ #define VM_PAD          8u                      /* 128 KB */
+@@ -934,7 +947,7 @@ blit_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t sc
+ static LCK_GRP_DECLARE(sweet_gpu_grp, "sweet_gpu");
+ static LCK_MTX_DECLARE(sweet_gpu_vm_lock, &sweet_gpu_grp);
+ static vm_offset_t g_smmu;
+-static uint64_t *g_l2[8];
++static uint64_t *g_l2[GVA_GB];
+ static uint64_t *g_l3[GVA_CHUNKS];
+ struct vm_mapping {
+ 	uint64_t va;            /* 0: free slot */
+@@ -997,14 +1010,19 @@ vm_init(vm_offset_t smmu)
+ 	for (unsigned i = 0; i < VM_PAD; i++) {
+ 		g_pad_pa[i] = pad;
+ 	}
+-	for (unsigned gb = 0; gb < 8; gb++) {
++	for (unsigned gb = 0; gb < GVA_GB; gb++) {
+ 		uint64_t pa;
+ 		g_l2[gb] = pt4k(&pa);
+ 		if (g_l2[gb] == NULL) {
+ 			return false;
+ 		}
+-		g_l1[8 + gb] = pa | 3u;                 /* table */
++		bzero(g_l2[gb], 4096);
++		flush_dcache64((addr64_t)pa, 4096, TRUE);
++		g_l1[GVA_L1 + gb] = pa | 3u;            /* table */
+ 	}
++#if defined(KUGO)
++	g_owner[0] = VM_GUARD;
++#endif
+ 	flush_dcache64((addr64_t)g_l1_pa, 4096, TRUE);
+ 	smmu_tlb_flush();
+ 	return true;
+@@ -1112,7 +1130,7 @@ sweet_gpu_vm_map(const uint64_t *pa, uint32_t npages, bool readonly)
+ void
+ sweet_gpu_vm_unmap(uint64_t va)
+ {
+-	if (g_maps == NULL || va < GVA_BASE || va - GVA_BASE >= (uint64_t)GVA_PAGES * PAGE_SIZE || (va & PAGE_MASK)) {
++	if (g_maps == NULL || !GVA_IN(va) || (va & PAGE_MASK)) {
+ 		return;
+ 	}
+ 	uint32_t first = (uint32_t)((va - GVA_BASE) / PAGE_SIZE);
+@@ -1138,7 +1156,7 @@ sweet_gpu_vm_unmap(uint64_t va)
+ static int
+ vm_range(uint64_t va, uint64_t len)
+ {
+-	if (g_maps == NULL || len == 0 || va < GVA_BASE || va - GVA_BASE >= (uint64_t)GVA_PAGES * PAGE_SIZE) {
++	if (g_maps == NULL || len == 0 || !GVA_IN(va)) {
+ 		return -1;
+ 	}
+ 	uint32_t m = g_owner[(va - GVA_BASE) / PAGE_SIZE];
+@@ -1249,6 +1267,23 @@ compute_run(vm_offset_t gpu, const struct sweet_kernel *k, uint64_t shader_pa,
+ 	emit(pkt4(R_SP_CS_CONFIG, 1)); emit(1);
+ 	emit(pkt4(R_HLSQ_CS_CONSTLEN, 2)); emit(k->constlen / 4); emit(k->instrlen);
+ 	emit(pkt4(R_TPL1_CS_TEX_COUNT, 1)); emit(x ? x->ntex : 0);
++#if defined(KUGO)
++	/*
++	 * The A510's texture unit read the border colour table at its unset base, GPU VA 0, even with
++	 * clamp-to-edge samplers (CB0 translation fault, FAR 0, then a hang; gpu-l6a): point it at a zero page.
++	 */
++	static uint64_t border_pa;
++	if (border_pa == 0) {
++		vm_offset_t bva;
++		border_pa = gpu_page(&bva);
++		if (border_pa != 0) {
++			bzero((void *)bva, PAGE_SIZE);
++			flush_dcache64((addr64_t)border_pa, PAGE_SIZE, TRUE);
++		}
++	}
++	emit(pkt4(0xe706, 2));                  /* TPL1_TP_BORDER_COLOR_BASE_ADDR */
++	emit((uint32_t)border_pa); emit((uint32_t)(border_pa >> 32));
++#endif
+ 	emit(pkt4(R_SP_CS_OBJ_START, 6));
+ 	emit((uint32_t)shader_pa); emit((uint32_t)(shader_pa >> 32));
+ 	emit(0);                                /* PVT_MEM_PARAM */
+@@ -1507,7 +1542,7 @@ sample_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t
+ 		src = vm_buffer(&sva, SW * SH * 4);
+ 		dst = vm_buffer(&dva, W * H * 4);
+ 	} else {
+-		src = gpu_page(&sva);
++		src = gpu_alloc(&sva, SW * SH * 4);    /* 16 KB: four of kugo's pages */
+ 		dst = gpu_alloc(&dva, W * H * 4);
+ 	}
+ 	if (src == 0 || dst == 0 || ks == 0) {
+@@ -1781,7 +1816,7 @@ smmu_report(void)
+ 	if (logged < 32) {
+ 		logged++;
+ 		int64_t below = -1;
+-		if (far >= GVA_BASE && far - GVA_BASE < (uint64_t)GVA_PAGES * PAGE_SIZE && g_owner != NULL) {
++		if (GVA_IN(far) && g_owner != NULL) {
+ 			for (int64_t p = (int64_t)((far - GVA_BASE) / PAGE_SIZE); p >= 0 && below < 0; p--) {
+ 				uint32_t m = g_owner[p];
+ 				if (m != 0 && m != VM_GUARD) {
