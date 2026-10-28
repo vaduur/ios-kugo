@@ -1,0 +1,13 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 3870b9b..dd1448f 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -642,7 +642,7 @@ static bool
+ zap_load(void)
+ {
+ 	*(volatile uint32_t *)(g_gpu_regs + R_SECVID_TRUST_CNTL * 4) = 0;
+-	__builtin_arm_dsb(DSB_SY);
++	__asm__ volatile ("dsb sy" ::: "memory");
+ 	uint32_t t = *(volatile uint32_t *)(g_gpu_regs + R_SECVID_TRUST_CNTL * 4);
+ 	printf("SWEET GPU: A510: RBBM_SECVID_TRUST_CNTL = 0 -> %08x\n", t);
+ 	return t == 0;
