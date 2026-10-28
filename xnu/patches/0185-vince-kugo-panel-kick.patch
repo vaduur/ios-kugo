@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index bf90e43..2e22e98 100644
+index bf90e43..3457b67 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -489,6 +489,35 @@ AppleCLCD::present(const uint8_t *rec)
@@ -8,7 +8,7 @@ index bf90e43..2e22e98 100644
  #if defined(ARM64_BOARD_CONFIG_VINCE)
 +#include <pexpert/arm64/board_config.h>
 +#if defined(KUGO)
-+#include <machine/machine_routines.h>
++extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);  /* as SweetCPU.cpp declares it */
 +
 +/*
 + * kugo's panel is command mode (VINCE.h): the 24-bpp buffer only reaches the screen when MDP CTL0
