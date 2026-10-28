@@ -1,0 +1,196 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 3457b67..19ea89c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -491,31 +491,8 @@ AppleCLCD::present(const uint8_t *rec)
+ #if defined(ARM64_BOARD_CONFIG_VINCE)
+ #include <pexpert/arm64/board_config.h>
+ #if defined(KUGO)
+-extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);  /* as SweetCPU.cpp declares it */
+-
+-/*
+- * kugo's panel is command mode (VINCE.h): the 24-bpp buffer only reaches the screen when MDP CTL0
+- * START sends it. Wait for the previous transfer (PING_PONG_0_DONE) first; a START mid-transfer
+- * desyncs the panel.
+- */
+-static void
+-kugo_panel_kick(void)
+-{
+-	static volatile uint8_t *mdss;
+-	if (mdss == NULL) {
+-		mdss = (volatile uint8_t *)ml_io_map(KUGO_MDSS_PHYS, 0x3000);
+-		if (mdss == NULL) {
+-			return;
+-		}
+-	}
+-	volatile uint32_t *status = (volatile uint32_t *)(mdss + KUGO_MDP_INTR_STATUS);
+-	for (unsigned int i = 0; i < 0x100000u && !(*status & (1u << KUGO_PP0_DONE_BIT)); i++) {
+-	}
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	*(volatile uint32_t *)(mdss + KUGO_MDP_INTR_CLEAR) = 1u << KUGO_PP0_DONE_BIT;
+-	*(volatile uint32_t *)(mdss + KUGO_CTL0_START) = 1;
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-}
++/* pe_serial.c: sends the 24-bpp buffer to the command-mode panel, serialised with the console's frames */
++extern "C" void kugo_panel_kick(void);
+ #endif
+ 
+ /*
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index e922e48..1b53aff 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -726,21 +726,109 @@ static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
+ #if defined(KUGO)
+ extern void kugo_plog_putc(char c);
+ 
+-/* Command-mode panel (see VINCE.h): each finished line goes out as one MDP frame. */
++/*
++ * Command-mode panel (see VINCE.h): a frame only reaches the screen when CTL0 START sends it. Every
++ * sender (fbcon after each line, AppleCLCD after each present) goes through kugo_panel_kick(), which
++ * runs with interrupts off and starts a frame only once the previous one signalled PING_PONG_0_DONE:
++ * a START mid-transfer desyncs the panel. kugoar=N instead turns on MDP autorefresh (a frame every
++ * N tear-check vsyncs) and the kicks become no-ops.
++ */
+ static volatile uint8_t *fbcon_mdss;
++static uint32_t kugo_kick_inflight, kugo_kick_timeouts, kugo_autorefresh;
++
++#define KUGO_MDSS_REG(off) (*(volatile uint32_t *)(fbcon_mdss + (off)))
++
++static void
++kugo_plog_str(const char *s)
++{
++	while (*s) {
++		kugo_plog_putc(*s++);
++	}
++}
+ 
+ static void
+-fbcon_kick(void)
++kugo_plog_hex(const char *name, uint32_t v)
++{
++	kugo_plog_str(name);
++	kugo_plog_putc('=');
++	for (int i = 28; i >= 0; i -= 4) {
++		kugo_plog_putc("0123456789abcdef"[(v >> i) & 0xf]);
++	}
++	kugo_plog_putc(' ');
++}
++
++/* Straight to the pstore record: called with interrupts off, possibly from inside printf. */
++static void
++kugo_panel_dump(const char *why)
++{
++	kugo_plog_str("KUGO MDP ");
++	kugo_plog_str(why);
++	kugo_plog_str(": ");
++	kugo_plog_hex("intr_en", KUGO_MDSS_REG(0x1010));
++	kugo_plog_hex("intr", KUGO_MDSS_REG(KUGO_MDP_INTR_STATUS));
++	kugo_plog_hex("ctl0_top", KUGO_MDSS_REG(0x2014));
++	kugo_plog_hex("ctl0_flush", KUGO_MDSS_REG(0x2018));
++	kugo_plog_hex("pp0_te", KUGO_MDSS_REG(KUGO_PP0 + KUGO_PP_TEAR_CHECK_EN));
++	kugo_plog_hex("vsync", KUGO_MDSS_REG(KUGO_PP0 + KUGO_PP_SYNC_CONFIG_VSYNC));
++	kugo_plog_hex("height", KUGO_MDSS_REG(KUGO_PP0 + KUGO_PP_SYNC_CONFIG_HEIGHT));
++	kugo_plog_hex("intcnt", KUGO_MDSS_REG(KUGO_PP0 + KUGO_PP_INT_COUNT_VAL));
++	kugo_plog_hex("line", KUGO_MDSS_REG(KUGO_PP0 + KUGO_PP_LINE_COUNT));
++	kugo_plog_hex("ar", KUGO_MDSS_REG(KUGO_PP0 + KUGO_PP_AUTOREFRESH));
++	kugo_plog_hex("timeouts", kugo_kick_timeouts);
++	kugo_plog_putc('\n');
++}
++
++void kugo_panel_kick(void);
++
++void
++kugo_panel_kick(void)
+ {
+ 	if (fbcon_mdss == NULL) {
+ 		return;
+ 	}
+-	volatile uint32_t *status = (volatile uint32_t *)(fbcon_mdss + KUGO_MDP_INTR_STATUS);
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++	if (kugo_autorefresh) {
++		__asm__ volatile ("dsb sy" ::: "memory");   /* the panel rereads the buffer by itself */
++		ml_set_interrupts_enabled(istate);
++		return;
++	}
++	if (kugo_kick_inflight) {
++		volatile uint32_t *status = (volatile uint32_t *)(fbcon_mdss + KUGO_MDP_INTR_STATUS);
++		for (unsigned int i = 0; i < 0x100000u && !(*status & (1u << KUGO_PP0_DONE_BIT)); i++) {
++		}
++		if (!(*status & (1u << KUGO_PP0_DONE_BIT))) {
++			kugo_kick_timeouts++;
++			if (kugo_kick_timeouts <= 3 || (kugo_kick_timeouts & 0xff) == 0) {
++				kugo_panel_dump("kick timeout");
++			}
++		}
++	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+-	*(volatile uint32_t *)(fbcon_mdss + KUGO_MDP_INTR_CLEAR) = 1u << KUGO_PP0_DONE_BIT;
+-	*(volatile uint32_t *)(fbcon_mdss + KUGO_CTL0_START) = 1;
++	KUGO_MDSS_REG(KUGO_MDP_INTR_CLEAR) = 1u << KUGO_PP0_DONE_BIT;
++	KUGO_MDSS_REG(KUGO_CTL0_START) = 1;
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+-	for (unsigned int i = 0; i < 0x100000u && !(*status & (1u << KUGO_PP0_DONE_BIT)); i++) {
++	kugo_kick_inflight = 1;
++	ml_set_interrupts_enabled(istate);
++}
++
++static void
++kugo_panel_init(void)
++{
++	uint32_t frames = 0;
++
++	fbcon_mdss = (volatile uint8_t *)ml_io_map(KUGO_MDSS_PHYS, KUGO_MDSS_MAP_SIZE);
++	if (fbcon_mdss == NULL) {
++		return;
++	}
++	kugo_panel_dump("at boot");
++	if (PE_parse_boot_argn("kugoar", &frames, sizeof(frames)) && frames != 0) {
++		KUGO_MDSS_REG(KUGO_PP0 + KUGO_PP_AUTOREFRESH) = (1u << 31) | (frames & 0xffff);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		KUGO_MDSS_REG(KUGO_MDP_INTR_CLEAR) = 1u << KUGO_PP0_DONE_BIT;
++		KUGO_MDSS_REG(KUGO_CTL0_START) = 1;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		kugo_autorefresh = frames;
++		kugo_panel_dump("autorefresh on");
+ 	}
+ }
+ #endif
+@@ -766,7 +854,7 @@ fbcon_newline(void)
+ 	fbcon_clear_row(fbcon_row);
+ 	fbcon_clear_row((fbcon_row + 1) % fbcon_rows);
+ #if defined(KUGO)
+-	fbcon_kick();
++	kugo_panel_kick();
+ #endif
+ }
+ 
+@@ -875,7 +963,7 @@ fbcon_probe(void)
+ 	}
+ 	fbcon_base = (volatile uint8_t *)ml_io_map_wcomb(reg[0], reg[1]);
+ #if defined(KUGO)
+-	fbcon_mdss = (volatile uint8_t *)ml_io_map(KUGO_MDSS_PHYS, 0x3000);
++	kugo_panel_init();
+ #endif
+ 	if (fbcon_base != NULL) {
+ 		register_serial_functions(&vince_fbcon_serial_functions);
+diff --git a/pexpert/pexpert/arm64/VINCE.h b/pexpert/pexpert/arm64/VINCE.h
+index e010a8e..5410d7d 100644
+--- a/pexpert/pexpert/arm64/VINCE.h
++++ b/pexpert/pexpert/arm64/VINCE.h
+@@ -66,6 +66,15 @@
+ #define KUGO_MDP_INTR_CLEAR       0x1018
+ #define KUGO_PP0_DONE_BIT         8
+ #define KUGO_CTL0_START           0x201c
++/* Ping-pong 0 (Android DT qcom,mdss-pingpong-off): tear check and autorefresh */
++#define KUGO_PP0                  0x71000
++#define KUGO_PP_TEAR_CHECK_EN     0x000
++#define KUGO_PP_SYNC_CONFIG_VSYNC 0x004
++#define KUGO_PP_SYNC_CONFIG_HEIGHT 0x008
++#define KUGO_PP_INT_COUNT_VAL     0x014
++#define KUGO_PP_LINE_COUNT        0x02c
++#define KUGO_PP_AUTOREFRESH       0x030
++#define KUGO_MDSS_MAP_SIZE        0x72000         // MDP registers up to and including PP0
+ 
+ /*
+  * vince's shim-visible page (SMP marks, halt word) sits at PA 0x913F0000, outside vince's XNU RAM
