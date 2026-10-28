@@ -1,0 +1,164 @@
+diff --git a/bsd/dev/vince_input.c b/bsd/dev/vince_input.c
+index c5375e5..881c3c5 100644
+--- a/bsd/dev/vince_input.c
++++ b/bsd/dev/vince_input.c
+@@ -20,6 +20,16 @@
+  * page select (0xFF).
+  *
+  * Boot-args: vincekeys=0 / vincetouch=0 turn a source off.
++ *
++ * KUGO (Xperia X Compact, MSM8956, PM8950): the same PON bits; volume up is
++ * TLMM GPIO 130. Touch is a Synaptics ClearPad (RMI4, live DT
++ * i2c@78b8000/synaptics_clearpad@2c) at 0x2c on BLSP1 QUP4, SDA/SCL GPIO
++ * 14/15 (blsp_i2c4 = function 3), attention GPIO 65, coordinates 720x1280.
++ * Its power belongs to the in-cell panel, which LK already runs: AVDD (L22)
++ * on, vddio switch (GPIO 126) and reset (GPIO 64) as LK leaves them work, so
++ * neither is touched here (driving GPIO 126 high turns the controller off).
++ * LK leaves the BLSP1 AHB clock unvoted and the I2C pins as GPIO outputs.
++ * Proven first in the iSony shim (shim/touch.c).
+  */
+ #if defined(ARM64_BOARD_CONFIG_VINCE)
+ #include <sys/param.h>
+@@ -29,6 +39,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/arm64/board_config.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+@@ -48,14 +59,29 @@ extern void vince_adreno_init(void);
+ #define TLMM_SIZE       0x56000u
+ #define GPIO_CTL(n)     ((uint32_t)(n) * 0x1000u)
+ #define GPIO_IO(n)      (GPIO_CTL(n) + 4u)
++#if defined(KUGO)
++#define GPIO_SDA        14
++#define GPIO_SCL        15
++#define GPIO_I2C_FUNC   3               /* blsp_i2c4 */
++#define GPIO_ATTN       65
++#define GPIO_VOLUP      130
++
++#define GCC_QUP3_PA     0x01805000u     /* blsp1_qup4_i2c_apps: RCG CMD +0, CFG +4, CBCR +0x20 */
++#define QUP3_PA         0x078b8000u
++#define GCC_VOTE_PA     0x01845000u     /* APCS clock branch vote +4, bit 10 blsp1_ahb */
++#define RMI_ADDR        0x2c
++#else
+ #define GPIO_SDA        10
+ #define GPIO_SCL        11
++#define GPIO_I2C_FUNC   2               /* blsp_i2c3 */
+ #define GPIO_RST        64
+ #define GPIO_ATTN       65
+ #define GPIO_VOLUP      85
+ 
+ #define GCC_QUP3_PA     0x01804000u     /* blsp1_qup3_i2c_apps: RCG CMD +0, CFG +4, CBCR +0x20 */
+ #define QUP3_PA         0x078b7000u
++#define RMI_ADDR        0x20
++#endif
+ 
+ #define QUP_CONFIG      0x000u
+ #define QUP_STATE       0x004u
+@@ -98,7 +124,6 @@ extern void vince_adreno_init(void);
+ #define CLK_CTL_400K    0xe031cu                /* 19.2 MHz XO, Linux's fast-mode divider */
+ #define CLK_CTL_100K    0x35du                  /* what the shim proved */
+ 
+-#define RMI_ADDR        0x20
+ #define VINCE_TOUCH_FINGERS 4
+ #define TOUCH_POLL_MS   8
+ 
+@@ -371,11 +396,19 @@ touch_hw_init(void)
+ {
+ 	static const uint8_t blk[4] = {4, 16, 32, 0};
+ 
+-	tlmm_cfg(GPIO_SDA, 2, 0, 0, false, false);      /* blsp_i2c3, no pull (board pull-ups), 2 mA */
+-	tlmm_cfg(GPIO_SCL, 2, 0, 0, false, false);
++	tlmm_cfg(GPIO_SDA, GPIO_I2C_FUNC, 0, 0, false, false);  /* no pull (board pull-ups), 2 mA */
++	tlmm_cfg(GPIO_SCL, GPIO_I2C_FUNC, 0, 0, false, false);
+ 	tlmm_cfg(GPIO_ATTN, 0, 3, 0, false, false);     /* input, pull-up */
++#if defined(KUGO)
++	vm_offset_t vote = ml_io_map(GCC_VOTE_PA, 0x1000);
++	if (vote && !(in_rd(vote, 4) & (1u << 10))) {
++		in_wr(vote, 4, in_rd(vote, 4) | (1u << 10));    /* BLSP1 AHB */
++		delay(100);
++	}
++#else
+ 	tlmm_cfg(GPIO_RST, 0, 3, 3, true, true);        /* out of reset */
+ 	in_sleep(&touch_chan, 200);
++#endif
+ 
+ 	if (in_rd(gcc, 0x20) & 0x80000000u) {
+ 		in_wr(gcc, 0x04, 0);                    /* source XO, divider bypass */
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 7000d01..eec8482 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -355,13 +355,28 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+  * (_UIEventHIDTouchEdgeTypeForHIDEvent); without it there is no home or
+  * app-switcher gesture.
+  */
+-#define SWEET_TOUCH_EDGE_PX 48
+ #if defined(ARM64_BOARD_CONFIG_VINCE)
++#include <pexpert/arm64/board_config.h>
++#endif
++#if defined(KUGO)
++/* kugo: 720x1280 panel showing 1125x2436 scaled into 592x1280 at column 64 (SweetFramebuffer.cpp) */
++#define SWEET_TOUCH_PANEL_W 720
++#define SWEET_TOUCH_PANEL_H 1280
++#define SWEET_TOUCH_EDGE_PX 32
++#define SWEET_TOUCH_SURFACE_MM_W 57
++#define SWEET_TOUCH_SURFACE_MM_H 101
++#elif defined(ARM64_BOARD_CONFIG_VINCE)
+ /* vince: 1080x2160 panel showing the centered part of 1125x2436 (SweetFramebuffer.cpp) */
+ #define SWEET_TOUCH_PANEL_H 2160
+ #else
+ #define SWEET_TOUCH_PANEL_H 2400
+ #endif
++#ifndef SWEET_TOUCH_PANEL_W
++#define SWEET_TOUCH_PANEL_W 1080
++#define SWEET_TOUCH_EDGE_PX 48
++#define SWEET_TOUCH_SURFACE_MM_W 68
++#define SWEET_TOUCH_SURFACE_MM_H 151
++#endif
+ class SweetHIDTouch : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDTouch);
+ public:
+@@ -441,12 +456,12 @@ SweetHIDTouch::start(IOService *provider)
+ 	}
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? 1080 : 1125;
++	fLogicalW = native ? SWEET_TOUCH_PANEL_W : 1125;
+ 	fLogicalH = native ? SWEET_TOUCH_PANEL_H : 2436;
+-	fOffX = (fLogicalW - 1080) / 2;
++	fOffX = (fLogicalW - SWEET_TOUCH_PANEL_W) / 2;
+ 	fOffY = (fLogicalH - SWEET_TOUCH_PANEL_H) / 2;
+ 	fMinX = 0;
+-	fMaxX = 1079;
++	fMaxX = SWEET_TOUCH_PANEL_W - 1;
+ #if defined(ARM64_BOARD_CONFIG_VINCE)
+ 	int crop = 0;
+ 	PE_parse_boot_argn("vincefb_crop", &crop, sizeof(crop));
+@@ -455,10 +470,10 @@ SweetHIDTouch::start(IOService *provider)
+ 		int outW = ((1125 * SWEET_TOUCH_PANEL_H + 2436 / 2) / 2436 + 4) & ~7;
+ 		int fill = 0;
+ 		PE_parse_boot_argn("vincefb_fill", &fill, sizeof(fill));
+-		if (fill) {
+-			outW = 1080;
++		if (outW > SWEET_TOUCH_PANEL_W || fill) {
++			outW = SWEET_TOUCH_PANEL_W & ~7;
+ 		}
+-		fMinX = (1080 - outW) / 2;
++		fMinX = (SWEET_TOUCH_PANEL_W - outW) / 2;
+ 		fMaxX = fMinX + outW - 1;
+ 		fOffX = -fMinX;
+ 		fLogicalW = outW;
+@@ -468,8 +483,8 @@ SweetHIDTouch::start(IOService *provider)
+ #endif
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+-	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+-	setProperty("SurfaceHeight", (unsigned long long)(151 << 16), 32);
++	setProperty("SurfaceWidth", (unsigned long long)(SWEET_TOUCH_SURFACE_MM_W << 16), 32);	/* mm, 16.16 */
++	setProperty("SurfaceHeight", (unsigned long long)(SWEET_TOUCH_SURFACE_MM_H << 16), 32);
+ 	gSweetTouch = this;
+ 	registerService();
+ 	IOLog("SWEET HID: touch registered\n");
