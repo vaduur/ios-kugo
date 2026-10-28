@@ -1,0 +1,14 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index e81d907..a2fd1cf 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2345,6 +2345,9 @@ gpu_thread(void *arg, wait_result_t result)
+ 	(void)poll(g, G_GX_GDSC, 1u << 31, 1u << 31, 100);
+ 	wr(g, G_GX_CLAMP, rd(g, G_GX_CLAMP) & ~1u);
+ 	bool b1 = branch_on(g, G_GFX3D_BR), b2 = branch_on(g, G_GMEM_BR);
++	/* ahb and bimc_gfx only report running once the CX GDSC is on: look again */
++	ahb = !(rd(g, G_AHB_BR) & (1u << 31));
++	bimc = !(rd(g, G_BIMC_GFX_BR) & (1u << 31));
+ 	kugo_dump(g, "after power-up:");
+ 	printf("SWEET GPU: cx %s ahb %s bimc_gfx %s gfx3d %s gmem %s\n", cx ? "on" : "TIMEOUT",
+ 	    ahb ? "on" : "OFF", bimc ? "on" : "OFF", b1 ? "on" : "OFF", b2 ? "on" : "OFF");
