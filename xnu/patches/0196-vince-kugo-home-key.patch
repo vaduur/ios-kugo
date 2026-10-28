@@ -1,0 +1,54 @@
+diff --git a/bsd/dev/vince_input.c b/bsd/dev/vince_input.c
+index 52c19a1..bcae107 100644
+--- a/bsd/dev/vince_input.c
++++ b/bsd/dev/vince_input.c
+@@ -70,6 +70,7 @@ extern void vince_adreno_init(void);
+ #define GPIO_ATTN       65
+ #define GPIO_VOLUP      130
+ #define GPIO_VOLDOWN    113             /* live DT gpio_keys/vol_dn; PON RESIN is a second volume up */
++#define GPIO_HOME       115             /* camera snapshot key: Home (Menu), the iPhone 8 UI needs one */
+ 
+ #define GCC_QUP3_PA     0x01805000u     /* blsp1_qup4_i2c_apps: RCG CMD +0, CFG +4, CBCR +0x20 */
+ #define QUP3_PA         0x078b8000u
+@@ -199,7 +200,7 @@ spmi_read(uint16_t addr, uint8_t *out)
+ static void
+ keys_thread(void *arg, wait_result_t result)
+ {
+-	int state[3] = {0, 0, 0};
++	int state[4] = {0, 0, 0, 0};
+ 	unsigned errors = 0;
+ 	(void)arg;
+ 	(void)result;
+@@ -207,15 +208,22 @@ keys_thread(void *arg, wait_result_t result)
+ 		uint8_t pon = 0;
+ 		bool ok = spmi_read(PON_RT_STS, &pon);
+ #if defined(KUGO)
+-		int now[3] = {!!(pon & 1u), !(in_rd(tlmm, GPIO_IO(GPIO_VOLUP)) & 1u), !(in_rd(tlmm, GPIO_IO(GPIO_VOLDOWN)) & 1u)};
++		int now[4] = {!!(pon & 1u), !(in_rd(tlmm, GPIO_IO(GPIO_VOLUP)) & 1u), !(in_rd(tlmm, GPIO_IO(GPIO_VOLDOWN)) & 1u),
++		    !(in_rd(tlmm, GPIO_IO(GPIO_HOME)) & 1u)};
++		const int nkeys = 4;
+ #else
+ 		int now[3] = {!!(pon & 1u), !(in_rd(tlmm, GPIO_IO(GPIO_VOLUP)) & 1u), !!(pon & 2u)};
++		const int nkeys = 3;
+ #endif
+ 		if (!ok && (errors++ % 250u) == 0) {
+ 			printf("VINCE INPUT: PON read error\n");
+ 		}
+-		for (int k = 0; k < 3; k++) {
++		for (int k = 0; k < nkeys; k++) {
++#if defined(KUGO)
++			if ((k != 0 || ok) && now[k] != state[k]) {    /* only power comes from the PON read */
++#else
+ 			if ((k == 1 || ok) && now[k] != state[k]) {
++#endif
+ 				state[k] = now[k];
+ 				printf("VINCE INPUT: key %d %s\n", k, state[k] ? "down" : "up");
+ 				sweet_hid_key(k, state[k]);
+@@ -574,6 +582,7 @@ vince_input_start(void)
+ #if defined(KUGO)
+ 		tlmm_cfg(GPIO_VOLUP, 0, 3, 0, false, false);    /* inputs with pull-up, active low */
+ 		tlmm_cfg(GPIO_VOLDOWN, 0, 3, 0, false, false);
++		tlmm_cfg(GPIO_HOME, 0, 3, 0, false, false);
+ #endif
+ 		if (spmi_obs && kernel_thread_start(keys_thread, NULL, &thread) == KERN_SUCCESS) {
+ 			thread_deallocate(thread);
