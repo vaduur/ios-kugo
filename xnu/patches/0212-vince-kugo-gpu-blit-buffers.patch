@@ -1,0 +1,48 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 966c73b..8f4ad0b 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -823,11 +823,14 @@ pat(uint32_t x, uint32_t y, uint32_t c)
+ }
+ 
+ /* Step 3: three 2D blits (see the header). */
++#define BLIT_BYTES      0x4000u
+ static void
+ blit_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t scratch)
+ {
++	/* 64 x 64 RGBA8 = 16 KB each: one page on iOS, four on kugo's 4 KB pages (they overlapped, gpu-flush1) */
+ 	vm_offset_t sva, d1va, d2va, d3va;
+-	uint64_t src = gpu_page(&sva), d1 = gpu_page(&d1va), d2 = gpu_page(&d2va), d3 = gpu_page(&d3va);
++	uint64_t src = gpu_alloc(&sva, BLIT_BYTES), d1 = gpu_alloc(&d1va, BLIT_BYTES);
++	uint64_t d2 = gpu_alloc(&d2va, BLIT_BYTES), d3 = gpu_alloc(&d3va, BLIT_BYTES);
+ 	if (src == 0 || d1 == 0 || d2 == 0 || d3 == 0) {
+ 		printf("SWEET GPU: no blit pages\n");
+ 		return;
+@@ -840,10 +843,10 @@ blit_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t sc
+ 			}
+ 		}
+ 	}
+-	flush_dcache64((addr64_t)src, PAGE_SIZE, TRUE);
+-	flush_dcache64((addr64_t)d1, PAGE_SIZE, TRUE);
+-	flush_dcache64((addr64_t)d2, PAGE_SIZE, TRUE);
+-	flush_dcache64((addr64_t)d3, PAGE_SIZE, TRUE);
++	flush_dcache64((addr64_t)src, BLIT_BYTES, TRUE);
++	flush_dcache64((addr64_t)d1, BLIT_BYTES, TRUE);
++	flush_dcache64((addr64_t)d2, BLIT_BYTES, TRUE);
++	flush_dcache64((addr64_t)d3, BLIT_BYTES, TRUE);
+ 	uint64_t fence = scratch + 16;
+ 	volatile uint32_t *fv = (volatile uint32_t *)(scratch_va + 16);
+ 	printf("SWEET GPU: blit pages src %llx dst %llx %llx %llx\n", src, d1, d2, d3);
+@@ -865,9 +868,9 @@ blit_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t sc
+ 		bool read = kick(gpu);
+ 		delay(5000);
+ 		flush_dcache64((addr64_t)scratch, 64, TRUE);
+-		flush_dcache64((addr64_t)d1, PAGE_SIZE, TRUE);
+-		flush_dcache64((addr64_t)d2, PAGE_SIZE, TRUE);
+-		flush_dcache64((addr64_t)d3, PAGE_SIZE, TRUE);
++		flush_dcache64((addr64_t)d1, BLIT_BYTES, TRUE);
++		flush_dcache64((addr64_t)d2, BLIT_BYTES, TRUE);
++		flush_dcache64((addr64_t)d3, BLIT_BYTES, TRUE);
+ 		uint32_t bad = 0, nonzero = 0, first = ~0u;
+ 		for (uint32_t y = 0; y < 64; y++) {
+ 			for (uint32_t x = 0; x < 64; x++) {
