@@ -1,0 +1,74 @@
+diff --git a/bsd/dev/vince_ctl.c b/bsd/dev/vince_ctl.c
+index eaa9d72..de826dc 100644
+--- a/bsd/dev/vince_ctl.c
++++ b/bsd/dev/vince_ctl.c
+@@ -78,6 +78,7 @@ vince_ctl_start(void)
+ 
+ #if defined(KUGO)
+ #include <pexpert/pexpert.h>
++#include <mach/mach_time.h>
+ 
+ void kugo_reset_now(const char *why);
+ void kugo_reset_start(void);
+@@ -106,15 +107,34 @@ kugo_reset_now(const char *why)
+ 	}
+ }
+ 
++/*
++ * The shim arms the watchdog (31 s) before jumping to us. It only counts while a CPU runs, so an idle
++ * kernel never tripped it, but a busy userland does: pet it every KUGO_WDT_PET_SECS. A kernel stuck with
++ * interrupts off still gets bitten. After kugoreset= seconds (0 = never) reset on purpose.
++ */
++#define KUGO_WDT_PET_SECS 5
++
+ static void
+ kugo_reset_thread(void *arg, wait_result_t result)
+ {
+ 	(void)result;
+-	uint64_t deadline;
+-	clock_interval_to_deadline((uint32_t)(uintptr_t)arg, NSEC_PER_SEC, &deadline);
+-	(void)assert_wait_deadline(&kugo_reset_chan, THREAD_UNINT, deadline);
+-	thread_block(THREAD_CONTINUE_NULL);
+-	kugo_reset_now("kugoreset timer expired");
++	uint32_t secs = (uint32_t)(uintptr_t)arg;
++	vm_offset_t wdt = ml_io_map(KUGO_WDT_PHYS, 0x1000);
++	uint64_t limit, start = mach_absolute_time();
++
++	nanoseconds_to_absolutetime((uint64_t)secs * NSEC_PER_SEC, &limit);
++	for (;;) {
++		if (wdt) {
++			*(volatile uint32_t *)(wdt + 0x04) = 1;       /* RST: restart the count */
++		}
++		if (secs != 0 && mach_absolute_time() - start >= limit) {
++			kugo_reset_now("kugoreset timer expired");
++		}
++		uint64_t deadline;
++		clock_interval_to_deadline(KUGO_WDT_PET_SECS, NSEC_PER_SEC, &deadline);
++		(void)assert_wait_deadline(&kugo_reset_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
+ }
+ 
+ /* Unattended test boots: return to Android after kugoreset= seconds (default KUGO_RESET_DEFAULT_SECS). */
+@@ -125,15 +145,15 @@ kugo_reset_start(void)
+ 	thread_t thread;
+ 
+ 	PE_parse_boot_argn("kugoreset", &secs, sizeof(secs));
+-	if (secs == 0) {
+-		printf("KUGO: auto reset off (kugoreset=0)\n");
+-		return;
+-	}
+ 	if (kernel_thread_start(kugo_reset_thread, (void *)(uintptr_t)secs, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+-		printf("KUGO: back to Android in %u s (kugoreset=)\n", secs);
++		if (secs != 0) {
++			printf("KUGO: back to Android in %u s (kugoreset=), watchdog petted\n", secs);
++		} else {
++			printf("KUGO: auto reset off (kugoreset=0), watchdog petted\n");
++		}
+ 	} else {
+-		printf("KUGO: auto reset thread not started\n");
++		printf("KUGO: watchdog/reset thread not started\n");
+ 	}
+ }
+ #endif /* KUGO */
