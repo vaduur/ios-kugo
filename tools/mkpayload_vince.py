@@ -106,7 +106,8 @@ def apply_chained_fixups(buf, m):
     return nfix
 
 
-def add_ramdisk_to_adt(adt_blob, phys, size):
+def add_memory_map_entry(adt_blob, name, phys, size):
+    """/chosen/memory-map NAME = (phys, size): md0's RAMDisk, or a blob a driver reads (GPU microcode)."""
     root, _ = adt.parse(adt_blob)
     chosen = next(c for c in root.children if c.name == 'chosen')
     mmap = next((c for c in chosen.children if c.name == 'memory-map'), None)
@@ -114,8 +115,8 @@ def add_ramdisk_to_adt(adt_blob, phys, size):
         mmap = adt.Node()
         mmap.props = [('name', 0, b'memory-map\0')]
         chosen.children.append(mmap)
-    assert mmap.prop('RAMDisk') is None, 'ADT already has a RAMDisk'
-    mmap.props.append(('RAMDisk', 0, struct.pack('<2Q', phys, size)))
+    assert mmap.prop(name) is None, f'ADT already has {name}'
+    mmap.props.append((name, 0, struct.pack('<2Q', phys, size)))
     return adt.serialize(root)
 
 
@@ -126,7 +127,7 @@ def adt_dram(adt_blob):
             struct.unpack('<Q', chosen.prop('dram-size'))[0])
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, blobs=()):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
@@ -143,15 +144,20 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
     pieces = [(s['vmaddr'], s['vmsize'], buf[s['fileoff']:s['fileoff'] + s['filesize']]) for s in segs]
     ramdisk = None
 
-    if ramdisk_path:
-        image = open(ramdisk_path, 'rb').read()
-        rd_size = (len(image) + PAGE - 1) & ~(PAGE - 1)
-        rd_va = kernel_end
-        kernel_end = rd_va + rd_size
-        rd_pa = rd_va - virt_base + phys_base
-        pieces.append((rd_va, rd_size, image))
-        adt_blob = add_ramdisk_to_adt(adt_blob, rd_pa, rd_size)
-        ramdisk = (hex(rd_pa), hex(rd_size))
+    extra = ([('RAMDisk', ramdisk_path)] if ramdisk_path else []) + list(blobs)
+    placed = []
+    for name, path in extra:
+        image = open(path, 'rb').read()
+        size = (len(image) + PAGE - 1) & ~(PAGE - 1)
+        va = kernel_end
+        kernel_end = va + size
+        pa = va - virt_base + phys_base
+        pieces.append((va, size, image))
+        # md0 wants whole pages; a blob's exact length matters (microcode word count)
+        adt_blob = add_memory_map_entry(adt_blob, name, pa, size if name == 'RAMDisk' else len(image))
+        placed.append((name, hex(pa), hex(len(image))))
+        if name == 'RAMDisk':
+            ramdisk = (hex(pa), hex(size))
 
     hdr_size = SEG_TABLE + 32 * len(pieces)
     out = bytearray(hdr_size)
@@ -176,7 +182,7 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
 
     info = dict(cputype=hex(m['cputype']), cpusub=m['cpusub'], fixups=nfix, virt_base=hex(virt_base),
                 entry=hex(m['entry']), kernel_end=hex(kernel_end), phys_base=hex(phys_base),
-                mem_size=hex(mem_size), ramdisk=ramdisk, size=len(out),
+                mem_size=hex(mem_size), ramdisk=ramdisk, blobs=placed, size=len(out),
                 segs=[(s['name'], hex(s['vmaddr']), hex(s['vmsize'])) for s in segs])
     return bytes(out), info
 
@@ -188,8 +194,10 @@ if __name__ == '__main__':
     ap.add_argument('out', help='Output payload path (e.g. artifacts/vince.payload)')
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress wdt=-1 wdt_test=no_user_checkin sweettouch=0 sweetkeys=0')
     ap.add_argument('--ramdisk', help='Optional root image for md0')
+    ap.add_argument('--blob', action='append', default=[], metavar='NAME=FILE',
+                    help='a file under /chosen/memory-map NAME (e.g. GPU-PM4=a530_pm4.bin)')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk)
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, [b.split('=', 1) for b in a.blob])
     open(a.out, 'wb').write(blob)
     print(f"[+] Vince XNU Payload written to {a.out} ({len(blob):,} bytes)")
     for k, v in info.items():
