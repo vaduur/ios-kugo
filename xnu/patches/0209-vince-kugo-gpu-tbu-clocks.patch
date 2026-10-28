@@ -1,0 +1,21 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 6d4c9ae..9a68be6 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2461,6 +2461,16 @@ gpu_thread(void *arg, wait_result_t result)
+ 		return;
+ 	}
+ 
++	/*
++	 * The GPU's SMMU TBUs/TCU (voted branches, APCS vote 0x4500c): LK leaves gfx_tbu (bit 3),
++	 * gfx_1_tbu (19) and gtcu_ahb (13) off, and without them the GPU read zeros from DRAM (the PFP saw
++	 * opcode 0, gpu-cp5) although the SMMU reported no fault. gfx_tcu (2), smmu_cfg (12) are on.
++	 */
++	wr(g, 0x4500c, rd(g, 0x4500c) | (1u << 2) | (1u << 3) | (1u << 12) | (1u << 13) | (1u << 19));
++	bool tbu = poll(g, 0x12010, 1u << 31, 0, 50), tbu1 = poll(g, 0x12098, 1u << 31, 0, 50);
++	bool tcu = poll(g, 0x12020, 1u << 31, 0, 50), gtcu = poll(g, 0x12044, 1u << 31, 0, 50);
++	printf("SWEET GPU: vote %08x: gfx_tbu %s gfx_1_tbu %s gfx_tcu %s gtcu_ahb %s\n", rd(g, 0x4500c),
++	    tbu ? "on" : "OFF", tbu1 ? "on" : "OFF", tcu ? "on" : "OFF", gtcu ? "on" : "OFF");
+ 	bool ahb = branch_on(g, G_AHB_BR), bimc = branch_on(g, G_BIMC_GFX_BR);
+ 	(void)branch_on(g, G_AON_BR);
+ 	(void)branch_on(g, G_TIMER_BR);
