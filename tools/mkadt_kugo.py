@@ -67,7 +67,15 @@ def d22ap_product(path):
     return None
 
 
-def build_kugo_adt(seed=None, product_from=None, ncpus=1):
+# Which iPhone's userland runs here (the root image and --product-from must match).
+IDENTITIES = {
+    # iPhone 8, the default: its 375x667 @2x UI fits the 720x1280 panel; Home = the camera key
+    'iphone8': ('D20AP', 'iPhone10,1', 1),
+    'iphonex': ('D22AP', 'iPhone10,3', 2),
+}
+
+
+def build_kugo_adt(seed=None, product_from=None, ncpus=1, identity='iphone8'):
     phys_base = PHYS_BASE
     mem_size = MEM_SIZE
 
@@ -171,7 +179,7 @@ def build_kugo_adt(seed=None, product_from=None, ncpus=1):
     buttons = node('buttons', [
         ph(),
         ('button-names', cstr('volup') + cstr('voldown') + cstr('hold')),
-        ('home-button-type', u32(2)),
+        ('home-button-type', u32(IDENTITIES[identity][2])),   # MobileGestalt HomeButtonType; 2 = none (iPhone X)
         ('opposed-power-vol-buttons', u32(1)),
     ])
 
@@ -199,6 +207,11 @@ def build_kugo_adt(seed=None, product_from=None, ncpus=1):
     cpus = node('cpus', [ph(), ('#address-cells', u32(1)), ('#size-cells', u32(0))], cpu_nodes)
 
     product_props = d22ap_product(product_from)
+    if product_props and identity == 'iphone8':
+        # As ios-sailfish: the panel is sRGB, and with "P3" iOS picks deep-color snapshot surfaces that
+        # CoreAnimation's CPU renderer cannot draw into (white dock / App Library backgrounds).
+        product_props = [(k, cstr('sRGB') if k in ('artwork-display-gamut', 'display-gamut') else v)
+                         for k, v in product_props]
     if product_props:
         product = node('product', [ph()] + product_props)
     else:
@@ -216,9 +229,9 @@ def build_kugo_adt(seed=None, product_from=None, ncpus=1):
     # without it: panic "Unable to find driver for this platform".
     root = node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('sony,kugo') + cstr('xiaomi,vince') +
-         cstr('qcom,msm8956') + cstr('AppleARM') + b'\0'),
-        ('model', cstr('iPhone10,3')),
+        ('compatible', cstr(IDENTITIES[identity][0]) + cstr(IDENTITIES[identity][1]) + cstr('sony,kugo') +
+         cstr('xiaomi,vince') + cstr('qcom,msm8956') + cstr('AppleARM') + b'\0'),
+        ('model', cstr(IDENTITIES[identity][1])),
         ('target-type', cstr('kugo')),
         ('target-sub-type', cstr('kugo')),
         ('manufacturer', cstr('Apple Inc.')),
@@ -234,10 +247,12 @@ def build_kugo_adt(seed=None, product_from=None, ncpus=1):
 def main():
     parser = argparse.ArgumentParser(description='Generate the kugo Apple Device Tree')
     parser.add_argument('output', help='output .adt file')
-    parser.add_argument('--product-from', help="iPhone X device tree (d22ap.adt, from the IPSW) for /product")
+    parser.add_argument('--product-from', help="the iPhone's device tree (d20ap.adt / d22ap.adt, from the IPSW) for /product")
+    parser.add_argument('--identity', choices=sorted(IDENTITIES), default='iphone8',
+                        help='userland identity: iphone8 (D20AP, default) or iphonex (D22AP)')
     parser.add_argument('--cpus', type=int, default=1, choices=range(1, 5), help='A53 cores in the ADT (1-4)')
     args = parser.parse_args()
-    data = adt.serialize(build_kugo_adt(product_from=args.product_from, ncpus=args.cpus))
+    data = adt.serialize(build_kugo_adt(product_from=args.product_from, ncpus=args.cpus, identity=args.identity))
     with open(args.output, 'wb') as f:
         f.write(data)
     print(f'kugo ADT: {args.output} ({len(data)} bytes)'
