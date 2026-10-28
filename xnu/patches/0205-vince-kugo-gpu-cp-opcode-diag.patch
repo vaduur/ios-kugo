@@ -1,0 +1,24 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 5cb519c..1361d7e 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2184,6 +2184,19 @@ cp_test(vm_offset_t gpu, int level)
+ 	flush_dcache64((addr64_t)scratch, 64, TRUE);
+ 	uint32_t got = *(volatile uint32_t *)scratch_va;
+ 	cp_state(gpu, read ? "ring consumed:" : "ring NOT consumed (200 ms):");
++#if defined(KUGO)
++	if (gr(gpu, R_CP_INTERRUPT_STATUS) & 1u) {
++		/* mainline a5xx_cp_err_irq: the opcode the PFP choked on */
++		gw(gpu, 0x0b0c, 0);                     /* CP_PFP_STAT_ADDR */
++		uint32_t d0 = gr(gpu, 0x0b0d);          /* CP_PFP_STAT_DATA */
++		uint32_t d1 = gr(gpu, 0x0b0d);
++		printf("SWEET GPU: CP opcode error: PFP stat %08x %08x; ME ucode %08x %08x, PFP ucode %08x %08x\n",
++		    d0, d1, ((volatile uint32_t *)phystokv(pm4))[0], ((volatile uint32_t *)phystokv(pm4))[1],
++		    ((volatile uint32_t *)phystokv(pfp))[0], ((volatile uint32_t *)phystokv(pfp))[1]);
++		printf("SWEET GPU: ring %08x %08x %08x %08x %08x %08x %08x %08x %08x | %08x %08x %08x %08x %08x\n",
++		    rb[0], rb[1], rb[2], rb[3], rb[4], rb[5], rb[6], rb[7], rb[8], rb[9], rb[10], rb[11], rb[12], rb[13]);
++	}
++#endif
+ 	smmu_faults(smmu, "after ring:");
+ 	printf("SWEET GPU: scratch %08x -> %s\n", got,
+ 	    got == 0xc0ffee01 ? "CP_MEM_WRITE landed: COMMAND PROCESSOR WORKS" : "no write");
