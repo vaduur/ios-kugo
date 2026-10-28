@@ -1,0 +1,35 @@
+diff --git a/bsd/dev/vince_input.c b/bsd/dev/vince_input.c
+index b5710b1..52c19a1 100644
+--- a/bsd/dev/vince_input.c
++++ b/bsd/dev/vince_input.c
+@@ -69,6 +69,7 @@ extern void vince_adreno_init(void);
+ #define GPIO_I2C_FUNC   3               /* blsp_i2c4 */
+ #define GPIO_ATTN       65
+ #define GPIO_VOLUP      130
++#define GPIO_VOLDOWN    113             /* live DT gpio_keys/vol_dn; PON RESIN is a second volume up */
+ 
+ #define GCC_QUP3_PA     0x01805000u     /* blsp1_qup4_i2c_apps: RCG CMD +0, CFG +4, CBCR +0x20 */
+ #define QUP3_PA         0x078b8000u
+@@ -205,7 +206,11 @@ keys_thread(void *arg, wait_result_t result)
+ 	for (;;) {
+ 		uint8_t pon = 0;
+ 		bool ok = spmi_read(PON_RT_STS, &pon);
++#if defined(KUGO)
++		int now[3] = {!!(pon & 1u), !(in_rd(tlmm, GPIO_IO(GPIO_VOLUP)) & 1u), !(in_rd(tlmm, GPIO_IO(GPIO_VOLDOWN)) & 1u)};
++#else
+ 		int now[3] = {!!(pon & 1u), !(in_rd(tlmm, GPIO_IO(GPIO_VOLUP)) & 1u), !!(pon & 2u)};
++#endif
+ 		if (!ok && (errors++ % 250u) == 0) {
+ 			printf("VINCE INPUT: PON read error\n");
+ 		}
+@@ -566,6 +571,10 @@ vince_input_start(void)
+ 		}
+ 		printf("VINCE INPUT: keys: arbiter %#x PON apid %u owner EE %u\n",
+ 		    spmi_core ? in_rd(spmi_core, 0) : 0, apid, owner);
++#if defined(KUGO)
++		tlmm_cfg(GPIO_VOLUP, 0, 3, 0, false, false);    /* inputs with pull-up, active low */
++		tlmm_cfg(GPIO_VOLDOWN, 0, 3, 0, false, false);
++#endif
+ 		if (spmi_obs && kernel_thread_start(keys_thread, NULL, &thread) == KERN_SUCCESS) {
+ 			thread_deallocate(thread);
+ 		} else {
