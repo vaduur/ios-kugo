@@ -1,0 +1,16 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index ca1c077..5cb519c 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2150,6 +2150,11 @@ cp_test(vm_offset_t gpu, int level)
+ 	gw64(gpu, R_CP_RB_BASE, rb_pa);
+ 	/* BUFSZ log2(16 KB / 8) = 11, BLKSZ log2(32 / 8) = 2 (mainline), NO_UPDATE */
+ 	gw(gpu, R_CP_RB_CNTL, 11u | (2u << 8) | (1u << 27));
++#if defined(KUGO)
++	/* A510 has no zap shader: leave secure mode before the CP runs (in it, CP_MEM_WRITE to normal memory
++	 * was refused with an opcode error, gpu-xnu6) */
++	(void)zap_load();
++#endif
+ 	cp_state(gpu, "before ME start:");
+ 
+ 	rb_n = 0;
