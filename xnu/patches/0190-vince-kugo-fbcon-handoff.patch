@@ -1,0 +1,97 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 19ea89c..6b01829 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -493,6 +493,8 @@ AppleCLCD::present(const uint8_t *rec)
+ #if defined(KUGO)
+ /* pe_serial.c: sends the 24-bpp buffer to the command-mode panel, serialised with the console's frames */
+ extern "C" void kugo_panel_kick(void);
++/* pe_serial.c: the console stops drawing over iOS */
++extern "C" void kugo_fbcon_handoff(void);
+ #endif
+ 
+ /*
+@@ -694,6 +696,11 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
++#if defined(KUGO)
++			if (!off) {
++				kugo_fbcon_handoff();
++			}
++#endif
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index f130490..ab2e019 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -51,23 +51,27 @@ kugo_early_kick(void)
+ /* pstore record (VINCE.h): PA (MMU off) / V=P L1[1] block (start.s), then the KVA block after the MDSS one. */
+ static volatile uint8_t *early_plog = (volatile uint8_t *)(uintptr_t)KUGO_PSTORE_PHYS;
+ 
+-/* Append to the console mirror; once the record is full, later output is dropped (the start matters most). */
++/*
++ * Append to the console mirror. The record is a ring, as ramoops reads every zone (header: signature,
++ * start = next write, size = valid bytes; Android unwraps it in order), so the latest output survives.
++ */
+ void
+ kugo_plog_putc(char c)
+ {
++	const uint32_t cap = KUGO_PSTORE_SIZE - 12;
+ 	volatile uint32_t *hdr = (volatile uint32_t *)early_plog;
+ 	if (hdr[0] != KUGO_PSTORE_SIG) {
+ 		hdr[1] = 0;
+ 		hdr[2] = 0;
+ 		hdr[0] = KUGO_PSTORE_SIG;
+ 	}
+-	uint32_t pos = hdr[2];
+-	if (pos >= KUGO_PSTORE_SIZE - 12) {
+-		return;
++	uint32_t pos = hdr[1], size = hdr[2];
++	if (pos >= cap) {
++		pos = 0;
+ 	}
+ 	early_plog[12 + pos] = (uint8_t)c;
+-	hdr[1] = pos + 1;
+-	hdr[2] = pos + 1;
++	hdr[1] = pos + 1 < cap ? pos + 1 : 0;
++	hdr[2] = size < cap ? size + 1 : cap;
+ 	if (c == '\n') {
+ 		__asm__ volatile("dsb sy" ::: "memory");
+ 	}
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 5995c8e..30e1e4c 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -736,6 +736,19 @@ extern void kugo_plog_putc(char c);
+  */
+ static volatile uint8_t *fbcon_mdss;
+ static uint32_t kugo_kick_timeouts, kugo_autorefresh;
++static uint32_t fbcon_quiet;            /* iOS owns the panel: output only goes to the pstore mirror */
++
++/* AppleCLCD, when backboardd turns the display on; kugofbcon=1 keeps the console drawing over iOS. */
++void kugo_fbcon_handoff(void);
++
++void
++kugo_fbcon_handoff(void)
++{
++	uint32_t keep = 0;
++	if (!PE_parse_boot_argn("kugofbcon", &keep, sizeof(keep)) || keep == 0) {
++		fbcon_quiet = 1;
++	}
++}
+ 
+ #define KUGO_MDSS_REG(off) (*(volatile uint32_t *)(fbcon_mdss + (off)))
+ 
+@@ -878,6 +891,9 @@ fbcon_transmit_data(uint8_t c)
+ {
+ #if defined(KUGO)
+ 	kugo_plog_putc((char)c);
++	if (fbcon_quiet) {
++		return;
++	}
+ #endif
+ 	if (c == '\r') {
+ 		fbcon_col = 0;
