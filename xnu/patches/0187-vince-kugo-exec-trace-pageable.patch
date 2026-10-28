@@ -1,0 +1,24 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index ee173c3..10c04d4 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7473,8 +7473,17 @@ process_signature(proc_t p, struct image_params *imgp)
+ 				if (a < e) {
+ 					a++;
+ 				}
+-				/* never read past the end of the argument strings: a page boundary there is a kernel data abort */
+-				printf("exec %s [%.*s]\n", p->p_name, (a < e) ? (int)MIN((long)60, (long)(e - a)) : 0, (a < e) ? a : "");
++				/*
++				 * The strings buffer is pageable: copy the job name out here, where a fault can be taken. printf
++				 * holds a spinlock, and a fault on a not yet resident page there is a kernel data abort.
++				 */
++				char job[61];
++				size_t n_job = 0;
++				while (a < e && n_job < sizeof(job) - 1 && *a != '\0') {
++					job[n_job++] = *a++;
++				}
++				job[n_job] = '\0';
++				printf("exec %s [%s]\n", p->p_name, job);
+ 			} else {
+ 				printf("exec %s\n", p->p_name);
+ 			}
