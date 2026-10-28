@@ -1,0 +1,101 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 1bd051b..c0d9ed2 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -518,7 +518,13 @@ SweetCPU::startCPU(vm_offset_t start_paddr __unused, vm_offset_t arg_paddr __unu
+ #if defined(VINCE)
+ 	/* The reset vector finds this CPU's data by MPIDR (cpu_start set cpu_reset_handler and flushed it). */
+ 	uint64_t entry = ml_static_vtop((vm_offset_t)&LowResetVectorBase);
++#if defined(KUGO)
++	IOLog("KUGO SMP: CPU_ON %#x at %#llx\n", fPhysId, entry);
++#endif
+ 	int64_t r = vince_psci(PSCI_CPU_ON_64, fPhysId, entry, 0);
++#if defined(KUGO)
++	IOLog("KUGO SMP: CPU_ON %#x returned %lld\n", fPhysId, r);
++#endif
+ 	if (r != 0) {
+ 		IOLog("SWEET CPU: PSCI CPU_ON(%#x, %#llx) = %lld\n", fPhysId, entry, r);
+ 		return KERN_FAILURE;
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 30e1e4c..d0eaa9d 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -738,6 +738,33 @@ static volatile uint8_t *fbcon_mdss;
+ static uint32_t kugo_kick_timeouts, kugo_autorefresh;
+ static uint32_t fbcon_quiet;            /* iOS owns the panel: output only goes to the pstore mirror */
+ 
++/*
++ * With more than one CPU, printf and kprintf reach the console from several cores at once, each kicking
++ * the panel: one START in the middle of another core's frame desyncs it for good. Both the drawing and
++ * the kick take a spinlock (interrupts off). The wait is bounded so a panic on a core that holds it
++ * still prints.
++ */
++static uint32_t fbcon_lock, kugo_kick_lock;
++
++static bool
++kugo_spin_lock(uint32_t *lock)
++{
++	for (unsigned int i = 0; i < 20000000u; i++) {
++		if (os_atomic_cmpxchg(lock, 0, 1, acquire)) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static void
++kugo_spin_unlock(uint32_t *lock, bool held)
++{
++	if (held) {
++		os_atomic_store(lock, 0, release);
++	}
++}
++
+ /* AppleCLCD, when backboardd turns the display on; kugofbcon=1 keeps the console drawing over iOS. */
+ void kugo_fbcon_handoff(void);
+ 
+@@ -806,6 +833,7 @@ kugo_panel_kick(void)
+ 		ml_set_interrupts_enabled(istate);
+ 		return;
+ 	}
++	bool held = kugo_spin_lock(&kugo_kick_lock);
+ 	volatile uint32_t *status = (volatile uint32_t *)(fbcon_mdss + KUGO_MDP_INTR_STATUS);
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	KUGO_MDSS_REG(KUGO_MDP_INTR_CLEAR) = 1u << KUGO_PP0_DONE_BIT;
+@@ -819,6 +847,7 @@ kugo_panel_kick(void)
+ 			kugo_panel_dump("kick timeout");
+ 		}
+ 	}
++	kugo_spin_unlock(&kugo_kick_lock, held);
+ 	ml_set_interrupts_enabled(istate);
+ }
+ 
+@@ -886,6 +915,8 @@ fbcon_transmit_ready(void)
+ 	return 1;
+ }
+ 
++static void fbcon_draw(uint8_t c);
++
+ static void
+ fbcon_transmit_data(uint8_t c)
+ {
+@@ -894,7 +925,19 @@ fbcon_transmit_data(uint8_t c)
+ 	if (fbcon_quiet) {
+ 		return;
+ 	}
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++	bool held = kugo_spin_lock(&fbcon_lock);
++	fbcon_draw(c);
++	kugo_spin_unlock(&fbcon_lock, held);
++	ml_set_interrupts_enabled(istate);
++#else
++	fbcon_draw(c);
+ #endif
++}
++
++static void
++fbcon_draw(uint8_t c)
++{
+ 	if (c == '\r') {
+ 		fbcon_col = 0;
+ 		return;
