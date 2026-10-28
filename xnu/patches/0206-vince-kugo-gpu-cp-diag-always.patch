@@ -1,0 +1,15 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 1361d7e..dcbf952 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2185,8 +2185,8 @@ cp_test(vm_offset_t gpu, int level)
+ 	uint32_t got = *(volatile uint32_t *)scratch_va;
+ 	cp_state(gpu, read ? "ring consumed:" : "ring NOT consumed (200 ms):");
+ #if defined(KUGO)
+-	if (gr(gpu, R_CP_INTERRUPT_STATUS) & 1u) {
+-		/* mainline a5xx_cp_err_irq: the opcode the PFP choked on */
++	{
++		/* mainline a5xx_cp_err_irq: the opcode the PFP choked on (printed always: the status bit did not hold) */
+ 		gw(gpu, 0x0b0c, 0);                     /* CP_PFP_STAT_ADDR */
+ 		uint32_t d0 = gr(gpu, 0x0b0d);          /* CP_PFP_STAT_DATA */
+ 		uint32_t d1 = gr(gpu, 0x0b0d);
