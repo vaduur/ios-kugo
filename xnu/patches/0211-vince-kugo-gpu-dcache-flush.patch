@@ -1,0 +1,32 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 19ebfe0..966c73b 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -132,6 +132,27 @@ extern vm_map_address_t phystokv(uint64_t pa);
+ extern boolean_t pmap_valid_page(ppnum_t pn);
+ void sweet_gpu_init(void);
+ 
++#if defined(KUGO)
++/*
++ * VINCE.h claims __ARM_COHERENT_IO__ (as Apple SoCs), which turns flush_dcache64 into a bare DSB, but
++ * the MSM8976 GPU does not snoop the CPU caches: the CP fetched zeros for a ring the CPU had just
++ * written (ROQ all zeros, gpu-dbg1) while the ucode, written before XNU, loaded fine. So clean and
++ * invalidate to the point of coherency by hand, a line at a time.
++ */
++static void
++kugo_flush_dcache64(addr64_t addr, unsigned len, boolean_t phys)
++{
++	addr64_t end = addr + len;
++	__asm__ volatile ("dsb sy" : : : "memory");
++	for (addr64_t a = addr & ~63ull; a < end; a += 64) {
++		uint64_t va = phys ? (uint64_t)phystokv(a & ~(addr64_t)PAGE_MASK) + (a & PAGE_MASK) : a;
++		__asm__ volatile ("dc civac, %0" : : "r"(va) : "memory");
++	}
++	__asm__ volatile ("dsb sy" : : : "memory");
++}
++#define flush_dcache64 kugo_flush_dcache64
++#endif
++
+ #if defined(KUGO)
+ #define GCC_PA          0x01800000u
+ #define GPU_PA          0x01c00000u
