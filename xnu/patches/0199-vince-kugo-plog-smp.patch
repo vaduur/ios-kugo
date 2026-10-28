@@ -1,0 +1,93 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index c0d9ed2..f23e721 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -12,6 +12,7 @@
+ #if defined(SWEET) || defined(VINCE)
+ #if defined(KUGO)
+ extern "C" void kugo_reset_start(void);
++extern "C" void kugo_plog_smp_on(void);
+ #endif
+ #include <IOKit/IOCPU.h>
+ #include <IOKit/IOLib.h>
+@@ -519,6 +520,7 @@ SweetCPU::startCPU(vm_offset_t start_paddr __unused, vm_offset_t arg_paddr __unu
+ 	/* The reset vector finds this CPU's data by MPIDR (cpu_start set cpu_reset_handler and flushed it). */
+ 	uint64_t entry = ml_static_vtop((vm_offset_t)&LowResetVectorBase);
+ #if defined(KUGO)
++	kugo_plog_smp_on();
+ 	IOLog("KUGO SMP: CPU_ON %#x at %#llx\n", fPhysId, entry);
+ #endif
+ 	int64_t r = vince_psci(PSCI_CPU_ON_64, fPhysId, entry, 0);
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index ab2e019..fb5cfab 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -9,6 +9,9 @@
+ 
+ #if defined(KUGO)
+ #include <arm64/proc_reg.h>
++#include <stdbool.h>
++#include <machine/atomic.h>
++#include <machine/machine_routines.h>
+ #define EARLY_FB_PHYS ((uint64_t)KUGO_FB_PHYS)
+ #define EARLY_WIDTH ((unsigned int)KUGO_FB_WIDTH)
+ #define EARLY_HEIGHT ((unsigned int)KUGO_FB_HEIGHT)
+@@ -55,9 +58,33 @@ static volatile uint8_t *early_plog = (volatile uint8_t *)(uintptr_t)KUGO_PSTORE
+  * Append to the console mirror. The record is a ring, as ramoops reads every zone (header: signature,
+  * start = next write, size = valid bytes; Android unwraps it in order), so the latest output survives.
+  */
++/*
++ * Once secondary CPUs run (SweetCPU calls kugo_plog_smp_on before the first PSCI CPU_ON) several cores
++ * write here at once; a torn header (start > size) makes ramoops drop the whole record. From then on the
++ * update is under a spinlock, interrupts off, bounded so a panic still gets through. Not before: the
++ * early writes happen with the MMU off, where exclusives on Device memory do not work.
++ */
++static uint32_t kugo_plog_lock;
++static bool kugo_plog_smp;
++
++void
++kugo_plog_smp_on(void)
++{
++	__asm__ volatile("dmb ish" ::: "memory");
++	kugo_plog_smp = true;
++}
++
+ void
+ kugo_plog_putc(char c)
+ {
++	boolean_t istate = FALSE;
++	bool held = false, smp = kugo_plog_smp;
++	if (smp) {
++		istate = ml_set_interrupts_enabled(FALSE);
++		for (unsigned int i = 0; i < 10000000u && !held; i++) {
++			held = os_atomic_cmpxchg(&kugo_plog_lock, 0, 1, acquire);
++		}
++	}
+ 	const uint32_t cap = KUGO_PSTORE_SIZE - 12;
+ 	volatile uint32_t *hdr = (volatile uint32_t *)early_plog;
+ 	if (hdr[0] != KUGO_PSTORE_SIG) {
+@@ -75,6 +102,12 @@ kugo_plog_putc(char c)
+ 	if (c == '\n') {
+ 		__asm__ volatile("dsb sy" ::: "memory");
+ 	}
++	if (smp) {
++		if (held) {
++			os_atomic_store(&kugo_plog_lock, 0, release);
++		}
++		ml_set_interrupts_enabled(istate);
++	}
+ }
+ #endif
+ 
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+index 536ea48..0f0af43 100644
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -16,6 +16,7 @@ void sweet_early_relocate(uint64_t base);
+ void sweet_early_disable(void);
+ #if defined(KUGO)
+ void kugo_plog_putc(char c);
++void kugo_plog_smp_on(void);
+ #endif
+ #else
+ static inline void sweet_early_mark(unsigned int stage, const char *label)
