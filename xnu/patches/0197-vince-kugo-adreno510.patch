@@ -1,0 +1,2822 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 4b430ef..1e726d2 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -126,6 +126,7 @@ bsd/dev/vince_wlan_net.c		standard
+ bsd/dev/vince_wlan_assoc.c		standard
+ bsd/dev/vince_wlan_crypto.c		standard
+ bsd/dev/vince_adreno.c			standard
++bsd/dev/sweet_gpu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+new file mode 100644
+index 0000000..3870b9b
+--- /dev/null
++++ b/bsd/dev/sweet_gpu.c
+@@ -0,0 +1,2504 @@
++/*
++ * KUGO (Xperia X Compact, MSM8956, Adreno 510, chip id 0x05010000): this is ios-sailfish's driver
++ * (MIT, Pixel 1 / Adreno 530) with the SoC parts redone after the live DT and mainline Linux
++ * (gcc-msm8976.c, a5xx_gpu.c), proven first by the iSony shim's GPU probe (shim/gpu.c):
++ *   GFX rail   PM8004 S5 (SID 5, ppid 0x520, FTS2.5, apps-owned SPMI channel; LK leaves it off
++ *              at 755 mV), CPR2 corners: 865 mV covers 200 and 266 MHz.
++ *   GCC        0x1800000: oxili_cx GDSC 0x5904c, oxili_gx GDSC 0x5901c (IO clamp 0x5b00c),
++ *              gfx3d RCG 0x59000 (GPLL0 = parent 1), branches gfx3d 0x59020, gmem 0x59024,
++ *              ahb 0x59028, timer 0x59040, aon 0x59044, bimc_gfx 0x59048.
++ *   GPU        0x1c00000; SMMU (ARM MMU-500, qsmmu-v500) 0x1f00000.
++ *   A510       no GPMU power islands, no zap shader: leaving secure mode is RBBM_SECVID_TRUST_CNTL = 0
++ *              (mainline's no-zap path); 256 KB GMEM, highest bank bit 14, mainline's a510
++ *              CP thresholds and CP_ME_INIT workaround word.
++ * Everything below about the Pixel stays as ios-sailfish wrote it.
++ *
++ * Adreno 530 power-up probe for the Pixel 1 (MSM8996), boot-arg sweetgpu=1.
++ * Step 1 of GPU acceleration: get the GPU powered and clocked and read its
++ * registers. Sequence after mainline Linux (mmcc-msm8996.c, gdsc.c,
++ * msm8996.dtsi gpu@b00000; sources in research/adreno/):
++ *   GFX rail   PMI8994 S2 (SID 3, ppid 0x317; S3 is its second phase),
++ *              apps-owned qpnp-regulator. Only touched if it is off: set to
++ *              745 mV (CPR ceiling of the 315 MHz corner) and enabled.
++ *   MMSS CC    0x8c0000: GPU_GDSC 0x4034 (CX), gpu_ahb_clk 0x403c, GPU_GX_GDSC
++ *              0x4024 (IO clamp 0x4300), gfx3d RCG 0x4000 = GPLL0/3 = 200 MHz,
++ *              gpu_gx_gfx3d_clk 0x4028, rbbmtimer RCG 0x4090 (XO) +
++ *              branch 0x40b0
++ *   GCC        0x300000: gcc_mmss_bimc_gfx_clk 0x9010, gcc_bimc_gfx_clk 0x46018
++ *   GPU        0xb00000 (dword offsets from a5xx.xml): VBIF_VERSION 0x3000,
++ *              RBBM_STATUS 0x4f5, RBBM_ALWAYSON_COUNTER_LO 0x4d2
++ * Runs 40 s after start with 11 s pauses between stages, so the UFS log
++ * ring (flushed every 10 s) holds the last good step if a stage hangs.
++ *
++ * sweetgpu=2 adds step 2, the command processor (mainline a5xx_hw_init /
++ * a5xx_me_init): GPU SMMU 0xb40000 identity-mapped (smmu_identity), CP
++ * microcode from the payload (mkpayload --blob GPU-PM4 / GPU-PFP = the
++ * vendor a530_pm4.fw / a530_pfp.fw without their 4-byte header; not in git),
++ * a 16 KB ring, CP_ME_INIT + CP_MEM_WRITE of 0xc0ffee01 to a scratch page
++ * (works, 0124a). The GPU stays in secure mode (TRUST_CNTL 1): writing
++ * RBBM_SECVID_TRUST_CNTL = 0 (mainline's no-zap-shader path) reset the
++ * phone; leaving it needs the zap shader loaded through TZ.
++ *
++ * sweetgpu=3 adds step 3, the 2D blitter (Mesa fd5_blitter.c emit_setup /
++ * emit_blit): after the CP test, three blits between kernel pages, checked
++ * by the CPU: RGBA8 64x64 copy, RGBA8 -> RGB888 (the panel format, alpha
++ * dropped) and a BLIT_OP_SCALE 32x32 -> 46x46 (1.44x, the AppleCLCD
++ * present() scale) into RGB888.
++ * The GPU starts in secure mode, where the RB writes nothing to normal
++ * memory (0128a: blits complete, destinations stay zero) and
++ * CP_SET_SECURE_MODE 0 hangs the CP without a zap shader (0129a). So, as
++ * mainline adreno_zap_shader_load: TZ PAS id 13 loads the vendor a530_zap
++ * (mkpayload --blob GPU-ZAP-MDT = a530_zap.mdt, GPU-ZAP-SEG = a530_zap.b02;
++ * not in git) into the gpu_mem carveout 0x90f00000 (1 MB, outside iOS
++ * DRAM), then the ring leaves secure mode.
++ *
++ * sweetgpu=4 adds step 4.1, the first shader: a compute kernel (ir3 assembly
++ * in tools/gpu-shaders/, assembled by tools/ir3asm into sweet_gpu_shaders.h)
++ * dispatched like Mesa's computerator a5xx backend (a5xx_emit_grid): 16
++ * workgroups of 64 write out[i] = i ^ 0x5a5a0000 into an SSBO, checked by
++ * the CPU. Then blend.asm: premultiplied BGRA8 source-over (CA's
++ * vAlpha_Blend_Premultiplied_BGRA_8888) on 1024 pixels, compared with the
++ * same arithmetic on the CPU.
++ *
++ * sweetgpu=5 adds a full-frame benchmark (1024x1024 BGRA = 4 MB per buffer):
++ * CPU cache clean+invalidate of the buffers, GPU blend submit-to-fence, and
++ * the same blend on one CPU core, to size the CPU<->GPU handoff cost.
++ * 0134a: cache maintenance 0.29 ms for 8 MB, GPU 8.3 ms, CPU 4.6 ms. Now
++ * per configuration: blend.asm at 200 MHz, blend4.asm (4 pixels and 128-bit
++ * accesses per invocation) at 200 MHz and at 300 MHz (GPLL0 / 2, inside the
++ * 745 mV corner).
++ * 0135a: blend4 @300 MHz 1.7-1.9 ms = ~2.5x one CPU core.
++ *
++ * sweetgpu=6 adds the textured-quad kernel (sample.asm: affine transform,
++ * bilinear sample through the texture unit, opacity, source-over), checked
++ * against integer CPU references: an identity placement and a 2x upscale at
++ * opacity 0.5.
++ *
++ * GPU address space (for buffers that are not physically contiguous, like
++ * IOSurfaces and user memory): context bank 0's L1 entries 8-15 point to L2
++ * tables, so GPU VA 8-16 GB is mapped with 4 KB pages, handed out in 2 MB
++ * chunks (sweet_gpu_vm_map / sweet_gpu_vm_unmap; the identity map below
++ * 8 GB stays for the kernel's own buffers). sweetgpu=7 brings the GPU up
++ * (CP, zap shader, non-secure) and runs the textured-quad checks on
++ * non-contiguous kernel memory through GPU VAs.
++ *
++ * sweetgpu=8 is service mode: bring-up, then the kernel API in sweet_gpu.h
++ * (sweet_gpu_quad: one bounds-checked, cache-maintained, synchronous
++ * textured quad between GPU-VA-mapped images) for the SweetGPU user client,
++ * checked once through that API.
++ */
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++#include <pexpert/arm64/board_config.h>
++#endif
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(KUGO)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <kern/locks.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++
++/* A compute kernel as tools/ir3asm describes it (sweet_gpu_shaders.h). */
++struct sweet_kernel {
++	const uint32_t *bin;
++	uint32_t size;
++	uint32_t instrlen, constlen;    /* 16-instruction units, vec4 */
++	int max_reg, max_half_reg, double_threadsize;
++	uint32_t branchstack;
++	uint32_t local[3];
++	uint32_t localid_regid, wgid_regid, num_bufs;
++};
++#include "sweet_gpu_shaders.h"
++#include "sweet_gpu.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++#if defined(KUGO)
++static bool kugo_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
++static bool kugo_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val);
++#define sweet_pmic_read kugo_pmic_read
++#define sweet_pmic_write kugo_pmic_write
++#else
++extern bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
++extern bool sweet_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val);
++#endif
++extern ppnum_t pmap_find_phys(pmap_t map, addr64_t va);
++extern vm_map_address_t phystokv(uint64_t pa);
++extern boolean_t pmap_valid_page(ppnum_t pn);
++void sweet_gpu_init(void);
++
++#if defined(KUGO)
++#define GCC_PA          0x01800000u
++#define GPU_PA          0x01c00000u
++#define SMMU_PA         0x01f00000u
++#define GFX_S2          0x520u          /* PM8004 S5 (the name stays: the rail code is shared) */
++#define KUGO_GFX_MV     865
++#define G_GFX3D_CMD     0x59000u        /* GCC offsets */
++#define G_GFX3D_CFG     0x59004u
++#define G_GX_GDSC       0x5901cu
++#define G_GFX3D_BR      0x59020u
++#define G_GMEM_BR       0x59024u
++#define G_AHB_BR        0x59028u
++#define G_TIMER_BR      0x59040u
++#define G_AON_BR        0x59044u
++#define G_BIMC_GFX_BR   0x59048u
++#define G_CX_GDSC       0x5904cu
++#define G_GX_CLAMP      0x5b00cu
++#define SPMI_CORE_PA    0x0200f000u
++#define SPMI_OBS_PA     0x02c00000u     /* reads: observer channel 0x8000 * apid */
++#define SPMI_CHNLS_PA   0x02400000u     /* writes: this EE's channel 0x8000 * apid */
++#else
++#define MMCC_PA         0x008c0000u
++#define GCC_PA          0x00300000u
++#define GPU_PA          0x00b00000u
++#define MEMACC_PA       0x007af000u     /* gfx_mem_acc corner at +0x004 */
++#define GFX_S2          0x317u
++#define ZAP_PA          0x90f00000u     /* msm8996.dtsi gpu_mem, 1 MB */
++#define ZAP_SIZE        0x00100000u
++#define GPU_PAS_ID      13
++#define SMMU_PA         0x00b40000u
++#endif
++
++/* a5xx.xml dword offsets */
++#define R_CP_RB_BASE            0x0800
++#define R_CP_RB_CNTL            0x0802
++#define R_CP_RB_RPTR            0x0806
++#define R_CP_RB_WPTR            0x0807
++#define R_CP_ROQ_THRESHOLDS_1   0x081f
++#define R_CP_ROQ_THRESHOLDS_2   0x0820
++#define R_CP_MEQ_THRESHOLDS     0x0825
++#define R_CP_MERCIU_SIZE        0x0826
++#define R_CP_PFP_ME_CNTL        0x0832
++#define R_CP_CHICKEN_DBG        0x0833
++#define R_CP_PFP_INSTR_BASE     0x0835
++#define R_CP_ME_INSTR_BASE      0x0838
++#define R_CP_INTERRUPT_STATUS   0x0b18
++#define R_CP_HW_FAULT           0x0b1a
++#define R_RBBM_AHB_CNTL0        0x0093
++#define R_RBBM_AHB_CNTL1        0x0094
++#define R_RBBM_AHB_CNTL2        0x0095
++#define R_RBBM_INT_0_STATUS     0x04e1
++#define R_RBBM_STATUS           0x04f5
++#define R_VBIF_RR_QOS_ARB       0x3049
++#define R_SECVID_TRUST_CNTL     0xf400
++#define R_SECVID_TSB_BASE       0xf800
++#define R_SECVID_TSB_SIZE       0xf802
++#define R_SECVID_TSB_CNTL       0xf803
++#define R_SECVID_TSB_ADDR_MODE  0xf810
++#define R_RBBM_PERFCTR_GPU_BUSY_MASKED 0x046f
++#define R_RB_MODE_CNTL          0x0cc6
++#define R_PC_DBG_ECO_CNTL       0x0d00
++#define R_VPC_DBG_ECO_CNTL      0x0e60
++#define R_UCHE_MODE_CNTL        0x0e81
++#define R_UCHE_WRITE_THRU_BASE  0x0e87
++#define R_UCHE_TRAP_BASE        0x0e89
++#define R_UCHE_GMEM_RANGE_MIN   0x0e8b
++#define R_UCHE_GMEM_RANGE_MAX   0x0e8d
++#define R_UCHE_CACHE_INVALIDATE_MIN 0x0e91
++#define R_UCHE_CACHE_WAYS       0x0e96
++#define R_SP_MODE_CNTL          0x0ec2
++#define R_HLSQ_MODE_CNTL        0x0e06
++#define R_TPL1_MODE_CNTL        0x0f02
++#define R_RB_2D_BLIT_CNTL       0x2100
++#define R_RB_2D_SRC_INFO        0x2107
++#define R_RB_2D_DST_INFO        0x2110
++#define R_GRAS_2D_BLIT_CNTL     0x2180
++#define R_GRAS_2D_SRC_INFO      0x2181
++#define R_GRAS_2D_DST_INFO      0x2182
++#define R_UNKNOWN_2184          0x2184
++#define R_GRAS_CL_CNTL          0xe000
++#define R_RB_CNTL               0xe140
++#define R_RB_RENDER_CNTL        0xe141
++#define R_GPMU_SP_POWER_CNTL    0xa881
++#define R_GPMU_RBCCU_POWER_CNTL 0xa887
++#define R_GPMU_SP_PWR_CLK_STATUS 0xa88b
++#define R_GPMU_RBCCU_PWR_CLK_STATUS 0xa88d
++/* compute (computerator a5xx.cc) */
++#define R_RB_DBG_ECO_CNTL       0x0cc4
++#define R_PC_MODE_CNTL          0x0d02
++#define R_HLSQ_TIMEOUT_THRESHOLD_0 0x0e00
++#define R_VPC_MODE_CNTL         0x0e62
++#define R_SP_DBG_ECO_CNTL       0x0ec0
++#define R_SP_SP_CNTL            0xe580
++#define R_SP_CS_CONFIG          0xe589
++#define R_SP_CS_CTRL_REG0       0xe5f0
++#define R_SP_CS_OBJ_START       0xe5f3
++#define R_TPL1_CS_TEX_COUNT     0xe751
++#define R_HLSQ_CONTROL_0_REG    0xe784
++#define R_HLSQ_UPDATE_CNTL      0xe78a
++#define R_HLSQ_CS_CONFIG        0xe790
++#define R_HLSQ_CS_CNTL          0xe796
++#define R_HLSQ_CS_NDRANGE_0     0xe7b0
++#define R_HLSQ_CS_CNTL_0        0xe7b7
++#define R_HLSQ_CS_KERNEL_GROUP_X 0xe7b9
++#define R_HLSQ_CS_CONSTLEN      0xe7dc
++/* a5xx_color_fmt */
++#define RB5_R8G8B8A8_UNORM      0x30
++#define RB5_R8G8B8_UNORM        0x31
++/* adreno_pm4.xml opcodes */
++#define CP_NOP                  0x10
++#define CP_MEM_WRITE            0x3d
++#define CP_ME_INIT              0x48
++#define CP_SET_SECURE_MODE      0x66
++#define CP_WAIT_FOR_IDLE        0x26
++#define CP_BLIT                 0x2c
++#define CP_EVENT_WRITE          0x46
++#define CP_SET_RENDER_MODE      0x6c
++#define CP_LOAD_STATE4          0x30
++#define CP_EXEC_CS              0x33
++#define BYPASS                  1
++#define SB4_CS_SHADER           0xd
++#define SB4_CS_SSBO             0xf
++#define SB4_CS_TEX              0x5
++#define R_TPL1_VS_TEX_COUNT     0xe700
++#define R_TPL1_FS_TEX_COUNT     0xe750
++#define BLIT2D                  5
++#define BLIT2DSCALE             7
++#define END2D                   8
++#define BLIT_OP_COPY            1
++#define BLIT_OP_SCALE           3
++#define CACHE_FLUSH_TS          0x04
++#define PC_CCU_FLUSH_COLOR_TS   0x1d
++
++static int gpu_chan;
++static vm_offset_t mmcc;        /* MMSS clock controller, for the gfx3d clock */
++
++static void
++gpu_sleep(unsigned secs)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(secs, NSEC_PER_SEC, &deadline);
++	(void)assert_wait_deadline(&gpu_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static int g_level;     /* the sweetgpu boot-arg */
++
++/*
++ * Pauses between bring-up stages (11 s: a hang or panic shows which stage
++ * it was). Service mode (sweetgpu=8) skips them: backboardd waits for it.
++ */
++static void
++gpu_wait(unsigned secs)
++{
++	if (g_level >= 8 && secs > 2) {
++		return;
++	}
++	gpu_sleep(secs);
++}
++
++static uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb sy" ::: "memory");
++	return v;
++}
++
++/*
++ * The value always goes through a real register ("r", never wzr): firmware
++ * traps and emulates some SMMU writes (S2CR), and a trapped `str wzr`
++ * stalled the CPU (0121a-0123a).
++ */
++static void
++wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile("dmb sy\n\tstr %w0, [%1]\n\tdsb sy" : : "r"(v), "r"(base + off) : "memory");
++}
++
++/* Poll until (reg & mask) == want, up to ms milliseconds. */
++static bool
++poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, unsigned ms)
++{
++	for (unsigned i = 0; i < ms * 10; i++) {
++		if ((rd(base, off) & mask) == want) {
++			return true;
++		}
++		delay(100);
++	}
++	return false;
++}
++
++/* gcc / gcc46: the GCC pages at 0x309000 and 0x346000. */
++static void
++dump(vm_offset_t mm, vm_offset_t gcc, vm_offset_t gcc46, const char *when)
++{
++	printf("SWEET GPU: %s mmcc gpu_gdsc %08x gx_gdsc %08x clamp %08x ahb %08x gfx3d_br %08x "
++	    "gfx3d_rcg %08x/%08x rbbm_rcg %08x/%08x rbbm_br %08x gcc mmss_bimc_gfx %08x bimc_gfx %08x\n",
++	    when, rd(mm, 0x4034), rd(mm, 0x4024), rd(mm, 0x4300), rd(mm, 0x403c), rd(mm, 0x4028),
++	    rd(mm, 0x4000), rd(mm, 0x4004), rd(mm, 0x4090), rd(mm, 0x4094), rd(mm, 0x40b0),
++	    rd(gcc, 0x10), rd(gcc46, 0x18));
++}
++
++/* Branch enable + wait for CLK_OFF (bit 31) to clear. */
++static bool
++branch_on(vm_offset_t base, uint32_t off)
++{
++	wr(base, off, rd(base, off) | 1u);
++	return poll(base, off, 1u << 31, 0, 10);
++}
++
++/* GDSC on: clear SW_COLLAPSE, wait for PWR_ON (bit 31). */
++static bool
++gdsc_on(vm_offset_t mm, uint32_t gdscr)
++{
++	wr(mm, gdscr, rd(mm, gdscr) & ~1u);
++	return poll(mm, gdscr, 1u << 31, 1u << 31, 10);
++}
++
++static uint32_t
++parity(uint32_t v)
++{
++	return (0x9669u >> (0xfu & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^
++	       (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1u;
++}
++
++/* msm_ringbuffer OUT_PKT7 header */
++static uint32_t
++pkt7(uint32_t op, uint32_t cnt)
++{
++	return (7u << 28) | cnt | (parity(cnt) << 15) | ((op & 0x7fu) << 16) | (parity(op) << 23);
++}
++
++static uint32_t
++pkt4(uint32_t reg, uint32_t cnt)
++{
++	return (4u << 28) | cnt | (parity(cnt) << 7) | ((reg & 0x3ffffu) << 8) | (parity(reg) << 27);
++}
++
++/* The ring: one 16 KB page (4096 dwords), wraps; rb_n is the next slot. */
++#define RB_DWORDS       4096u
++static uint32_t *rb, rb_n;
++static uint64_t rb_pa;
++
++static void
++emit(uint32_t v)
++{
++	rb[rb_n] = v;
++	rb_n = (rb_n + 1) & (RB_DWORDS - 1);
++}
++
++static void
++gw(vm_offset_t gpu, uint32_t reg, uint32_t v)
++{
++	wr(gpu, reg * 4, v);
++}
++
++static uint32_t
++gr(vm_offset_t gpu, uint32_t reg)
++{
++	return rd(gpu, reg * 4);
++}
++
++static void
++gw64(vm_offset_t gpu, uint32_t reg, uint64_t v)
++{
++	gw(gpu, reg, (uint32_t)v);
++	gw(gpu, reg + 1, (uint32_t)(v >> 32));
++}
++
++/* Physically contiguous, zeroed kernel memory; returns its PA (0 on failure). */
++static uint64_t
++gpu_alloc(vm_offset_t *va, vm_size_t size)
++{
++	if (kmem_alloc_contig(kernel_map, va, size, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return 0;
++	}
++	return ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)*va));
++}
++
++/* One 16 KB page. */
++static uint64_t
++gpu_page(vm_offset_t *va)
++{
++	return gpu_alloc(va, PAGE_SIZE);
++}
++
++static bool
++blob(const char *name, uint64_t *pa, uint32_t *len)
++{
++	DTEntry node;
++	uint64_t const *v;
++	unsigned int size;
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &node) != kSuccess ||
++	    SecureDTGetProperty(node, name, (void const **)&v, &size) != kSuccess || size != 16) {
++		return false;
++	}
++	*pa = v[0];
++	*len = (uint32_t)v[1];
++	return true;
++}
++
++static void
++cp_state(vm_offset_t gpu, const char *when)
++{
++	printf("SWEET GPU: %s RBBM_STATUS %08x RPTR %u WPTR %u CP_HW_FAULT %08x CP_INT %08x RBBM_INT %08x TRUST %08x\n",
++	    when, gr(gpu, R_RBBM_STATUS), gr(gpu, R_CP_RB_RPTR), gr(gpu, R_CP_RB_WPTR),
++	    gr(gpu, R_CP_HW_FAULT), gr(gpu, R_CP_INTERRUPT_STATUS), gr(gpu, R_RBBM_INT_0_STATUS),
++	    gr(gpu, R_SECVID_TRUST_CNTL));
++}
++
++/*
++ * GPU SMMU (ARM SMMUv2, 2 context banks, 4 KB pages, CBs from 0x8000):
++ * firmware ignores sCR0.CLIENTPD (bypass) and the stream starts as FAULT
++ * (0120a: S2CR0 0x000200ff, the first CP fetch reset the phone). Like
++ * mainline (which translates through a context bank on MSM8996), but with
++ * an identity map: context bank 0, stage 1 AArch64, 4 KB granule, 36-bit
++ * VA = PA, 1 GB blocks for 0x80000000-0x1ffffffff (DRAM), normal
++ * non-cacheable; SMR0 = stream 0 only, as the Pixel kernel (stream 2 is
++ * TZ's gfx3d_secure: an SMR matching every stream stalled the CPU on the
++ * S2CR write in 0122a, the firmware traps it). Returns false (and the GPU
++ * must not touch memory) unless every write reads back.
++ */
++/* Traced SMMU write: 0121a stalled a CPU on one of them. */
++#define SWR(base, off, val) do { \
++	printf("SWEET GPU: smmu wr %s+0x%x = %08x\n", #base, (unsigned)(off), (unsigned)(val)); \
++	wr(base, off, val); \
++} while (0)
++
++static uint64_t *g_l1, g_l1_pa;  /* context bank 0 L1 table (64 x 1 GB) */
++
++static bool
++smmu_identity(vm_offset_t smmu)
++{
++	vm_offset_t pt_va;
++	uint64_t pt = gpu_page(&pt_va);
++	if (pt == 0) {
++		printf("SWEET GPU: no page-table page\n");
++		return false;
++	}
++	printf("SWEET GPU: page table at %llx\n", pt);
++	uint64_t *l1 = (uint64_t *)pt_va;
++	g_l1 = l1;
++	g_l1_pa = pt;
++#if defined(KUGO)
++	for (uint64_t gb = 1; gb < 4; gb++) {   /* kugo DRAM 0x40000000-0xffffffff (3 GB) */
++#else
++	for (uint64_t gb = 2; gb < 8; gb++) {
++#endif
++		/* block | AttrIndx 0 | AP[1] (EL0 too) | SH outer | AF */
++		l1[gb] = (gb << 30) | 1u | (1u << 6) | (2u << 8) | (1u << 10);
++	}
++	flush_dcache64((addr64_t)pt, PAGE_SIZE, TRUE);
++	vm_offset_t gr1 = smmu + 0x1000, cb = smmu + 0x8000;
++	SWR(cb, 0x0, 0);                         /* SCTLR off while configuring */
++	SWR(gr1, 0x0, 1u << 16);                 /* CBAR0: S1 translate, S2 bypass */
++	SWR(gr1, 0x800, 1u);                     /* CBA2R0: VA64 */
++	SWR(cb, 0x10, (7u << 15) | 1u);          /* TCR2: SEP upstream, PASIZE 36 bit */
++	SWR(cb, 0x30, 28u | (1u << 23));         /* TCR: T0SZ 28, TG0 4K, walks NC, EPD1 */
++	SWR(cb, 0x38, 0x44u);                    /* MAIR0: attr0 normal non-cacheable */
++	SWR(cb, 0x20, (uint32_t)pt);             /* TTBR0, ASID 0 */
++	SWR(cb, 0x24, (uint32_t)(pt >> 32));
++	SWR(cb, 0x58, 0xffffffffu);              /* FSR: clear */
++	/*
++	 * AFE TRE M, no CFRE: a faulting access is terminated without an abort
++	 * to the GPU (reads 0, writes dropped). Texture/vertex fetch reads a
++	 * little past buffer ends; with CFRE that hung the GPU (0154a/c).
++	 * Faults are still recorded in FSR/FAR: sweet_gpu_submit logs them.
++	 */
++	SWR(cb, 0x0, (1u << 2) | (1u << 1) | 1u);
++	SWR(smmu, 0x800, 1u << 31);             /* SMR0: stream 0 (gfx3d_user), mask 0 */
++	SWR(smmu, 0xc00, 0);                     /* S2CR0: translate, context bank 0 */
++	SWR(smmu, 0x68, 0);                      /* TLBIALLNSNH */
++	SWR(smmu, 0x70, 0);                      /* sTLBGSYNC */
++	bool synced = poll(smmu, 0x74, 1u, 0, 10);
++	uint32_t smr = rd(smmu, 0x800), s2cr = rd(smmu, 0xc00), cbar = rd(gr1, 0x0);
++	uint32_t sctlr = rd(cb, 0x0), tcr = rd(cb, 0x30), ttbr = rd(cb, 0x20);
++	bool ok = synced && smr == (1u << 31) && (s2cr & 0x300ff) == 0 &&
++	    (cbar & (3u << 16)) == (1u << 16) && (sctlr & 0x27) == 0x07 && tcr == (28u | (1u << 23)) &&
++	    ttbr == (uint32_t)pt;
++	printf("SWEET GPU: SMMU identity %s: pt %llx SMR0 %08x S2CR0 %08x CBAR0 %08x SCTLR %08x TCR %08x TTBR0 %08x tlbsync %d\n",
++	    ok ? "ok" : "REJECTED", pt, smr, s2cr, cbar, sctlr, tcr, ttbr, synced);
++	return ok;
++}
++
++static void
++smmu_faults(vm_offset_t smmu, const char *when)
++{
++	vm_offset_t cb = smmu + 0x8000;
++	printf("SWEET GPU: %s SMMU sGFSR %08x CB0 FSR %08x FAR %08x%08x FSYNR0 %08x\n", when,
++	    rd(smmu, 0x48), rd(cb, 0x58), rd(cb, 0x64), rd(cb, 0x60), rd(cb, 0x68));
++}
++
++/* Submit everything emitted so far; true once the CP has read it all. */
++static bool
++kick(vm_offset_t gpu)
++{
++	flush_dcache64((addr64_t)rb_pa, PAGE_SIZE, TRUE);
++	gw(gpu, R_CP_RB_WPTR, rb_n);
++	/* spin: delay(1000) here put a 1 ms floor under every quad (0141a) */
++	uint64_t deadline;
++	clock_interval_to_deadline(200, NSEC_PER_MSEC, &deadline);
++	while (gr(gpu, R_CP_RB_RPTR) != rb_n) {
++		if (mach_absolute_time() > deadline) {
++			return false;
++		}
++	}
++	return true;
++}
++
++/* Mesa fd5_blitter.c: one 2D blit, then flush the CCU/UCHE and write fence. */
++static void
++emit_blit(uint32_t op, uint32_t sfmt, uint64_t src, uint32_t spitch, uint32_t sw, uint32_t sh,
++    uint32_t dfmt, uint64_t dst, uint32_t dpitch, uint32_t dw, uint32_t dh, uint64_t fence, uint32_t seq)
++{
++	emit(pkt4(R_UCHE_CACHE_INVALIDATE_MIN, 5));
++	emit(0); emit(0); emit(0); emit(0);
++	emit(0x12);                             /* UCHE_CACHE_INVALIDATE */
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	/* emit_setup */
++	emit(pkt4(R_RB_RENDER_CNTL, 1)); emit(0x8);
++	emit(pkt4(R_RB_2D_BLIT_CNTL, 1)); emit(0x86000000);
++	emit(pkt4(R_GRAS_2D_BLIT_CNTL, 1)); emit(0x86000000);
++	emit(pkt4(R_UNKNOWN_2184, 1)); emit(0x9);
++	emit(pkt4(R_RB_CNTL, 1)); emit(1u << 17);       /* BYPASS */
++	emit(pkt4(R_RB_MODE_CNTL, 1)); emit(0x4);
++	emit(pkt4(R_SP_MODE_CNTL, 1)); emit(0xc);
++	emit(pkt4(R_TPL1_MODE_CNTL, 1)); emit(0x344);
++	emit(pkt4(R_HLSQ_MODE_CNTL, 1)); emit(0x2);
++	emit(pkt4(R_GRAS_CL_CNTL, 1)); emit(0x181);
++	/* emit_blit; linear, swap WZYX, size = pitch | array pitch, in 64-byte units */
++	emit(pkt7(CP_SET_RENDER_MODE, 1)); emit(op == BLIT_OP_SCALE ? BLIT2DSCALE : BLIT2D);
++	emit(pkt4(R_RB_2D_SRC_INFO, 9));
++	emit(sfmt);
++	emit((uint32_t)src); emit((uint32_t)(src >> 32));
++	emit((spitch >> 6) | (((spitch * sh) >> 6) << 16));
++	emit(0); emit(0); emit(0); emit(0); emit(0);
++	emit(pkt4(R_GRAS_2D_SRC_INFO, 1)); emit(sfmt);
++	emit(pkt4(R_RB_2D_DST_INFO, 9));
++	emit(dfmt);
++	emit((uint32_t)dst); emit((uint32_t)(dst >> 32));
++	emit((dpitch >> 6) | (((dpitch * dh) >> 6) << 16));
++	emit(0); emit(0); emit(0); emit(0); emit(0);
++	emit(pkt4(R_GRAS_2D_DST_INFO, 1)); emit(dfmt);
++	emit(pkt7(CP_BLIT, 5));
++	emit(op);
++	emit(0);                                /* SRC_X1/Y1 */
++	emit((sw - 1) | ((sh - 1) << 16));      /* SRC_X2/Y2 */
++	emit(0);                                /* DST_X1/Y1 */
++	emit((dw - 1) | ((dh - 1) << 16));      /* DST_X2/Y2 */
++	emit(pkt7(CP_SET_RENDER_MODE, 1)); emit(END2D);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	emit(pkt7(CP_EVENT_WRITE, 4)); emit(PC_CCU_FLUSH_COLOR_TS);
++	emit((uint32_t)fence); emit((uint32_t)(fence >> 32)); emit(0);
++	emit(pkt7(CP_EVENT_WRITE, 4)); emit(CACHE_FLUSH_TS);
++	emit((uint32_t)fence); emit((uint32_t)(fence >> 32)); emit(seq);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++}
++
++/*
++ * Qualcomm SCM call, ARM SMCCC (qcom_scm-smc.c): standard call, SMC64, SIP
++ * owner, fn (svc << 8) | cmd, x1 = arginfo, x2-x5 = args. TZ may return
++ * INTERRUPTED (1: call again with x0 = 1, x6 as returned) or
++ * EBUSY (-12: retry later). Returns x0 (0 = ok); *r1 = x1.
++ */
++static int64_t
++scm_call(uint32_t svc, uint32_t cmd, uint32_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *r1)
++{
++	uint64_t fn = (1ull << 30) | (2ull << 24) | ((uint64_t)svc << 8) | cmd;
++	for (int busy = 0;; busy++) {
++		uint64_t a0 = fn, a6 = 0;
++		register uint64_t x0 __asm__("x0"), x1 __asm__("x1"), x2 __asm__("x2"), x3 __asm__("x3");
++		register uint64_t x4 __asm__("x4"), x5 __asm__("x5"), x6 __asm__("x6"), x7 __asm__("x7");
++		do {
++			x0 = a0; x1 = arginfo; x2 = a; x3 = b; x4 = c; x5 = 0; x6 = a6; x7 = 0;
++			__asm__ volatile("smc #0"
++			    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++			    :
++			    : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++			a0 = 1;
++			a6 = x6;
++		} while (x0 == 1);
++		if ((int64_t)x0 != -12 || busy >= 20) {
++			if (r1) {
++				*r1 = x1;
++			}
++			return (int64_t)x0;
++		}
++		delay(30000);
++	}
++}
++
++/* ELF32 program header */
++struct zap_phdr {
++	uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align;
++};
++
++/*
++ * mainline qcom_mdt_load + qcom_scm_pas_auth_and_reset for the split
++ * a530_zap: metadata = the .mdt (ELF header + phdrs + hash segment), one
++ * relocatable loadable segment (the .b02) placed at the carveout start.
++ */
++#if defined(KUGO)
++/* A510 has no zap shader (mainline adreno catalog): leave secure mode directly, as mainline does. */
++static vm_offset_t g_gpu_regs;
++static bool
++zap_load(void)
++{
++	*(volatile uint32_t *)(g_gpu_regs + R_SECVID_TRUST_CNTL * 4) = 0;
++	__builtin_arm_dsb(DSB_SY);
++	uint32_t t = *(volatile uint32_t *)(g_gpu_regs + R_SECVID_TRUST_CNTL * 4);
++	printf("SWEET GPU: A510: RBBM_SECVID_TRUST_CNTL = 0 -> %08x\n", t);
++	return t == 0;
++}
++#else
++static bool
++zap_load(void)
++{
++	uint64_t mdt, seg;
++	uint32_t mdt_len, seg_len;
++	if (!blob("GPU-ZAP-MDT", &mdt, &mdt_len) || !blob("GPU-ZAP-SEG", &seg, &seg_len)) {
++		printf("SWEET GPU: no GPU-ZAP-MDT/GPU-ZAP-SEG in the payload\n");
++		return false;
++	}
++	vm_offset_t meta_va;
++	uint64_t meta = gpu_page(&meta_va);
++	if (meta == 0 || mdt_len > PAGE_SIZE || mdt_len < 0x34) {
++		printf("SWEET GPU: zap metadata %u bytes, no page\n", mdt_len);
++		return false;
++	}
++	memcpy((void *)meta_va, (const void *)phystokv(mdt), mdt_len);
++	const uint8_t *m = (const uint8_t *)meta_va;
++	uint32_t phoff = *(const uint32_t *)(m + 0x1c);
++	uint16_t phnum = *(const uint16_t *)(m + 0x2c);
++	uint32_t lo = ~0u, hi = 0, filesz = 0, memsz = 0, nload = 0;
++	for (uint32_t i = 0; i < phnum && phoff + (i + 1) * 32 <= mdt_len; i++) {
++		const struct zap_phdr *ph = (const struct zap_phdr *)(m + phoff + i * 32);
++		/* PT_LOAD, not the hash segment (type field 2 in flags 26:24), not empty */
++		if (ph->type != 1 || ((ph->flags >> 24) & 7) == 2 || ph->memsz == 0) {
++			continue;
++		}
++		nload++;
++		lo = ph->paddr;
++		hi = (ph->paddr + ph->memsz + 0xfff) & ~0xfffu;
++		filesz = ph->filesz;
++		memsz = ph->memsz;
++	}
++	if (nload != 1 || filesz != seg_len || memsz > ZAP_SIZE) {
++		printf("SWEET GPU: zap layout unexpected: %u loadable, filesz %u seg %u memsz %u\n",
++		    nload, filesz, seg_len, memsz);
++		return false;
++	}
++	flush_dcache64((addr64_t)meta, PAGE_SIZE, TRUE);
++	uint64_t r1 = 0;
++	/* PAS_INIT_IMAGE (svc 2 cmd 1): args (pas id VAL, metadata RW) */
++	int64_t r = scm_call(2, 1, 2u | (2u << 6), GPU_PAS_ID, meta, 0, &r1);
++	printf("SWEET GPU: zap init_image (meta %llx, %u bytes) -> %lld/%llx\n", meta, mdt_len, r, r1);
++	if (r != 0 || r1 != 0) {
++		return false;
++	}
++	/* PAS_MEM_SETUP (svc 2 cmd 2): pas id, base, size */
++	r = scm_call(2, 2, 3, GPU_PAS_ID, ZAP_PA, hi - lo, &r1);
++	printf("SWEET GPU: zap mem_setup %x + %x -> %lld/%llx\n", ZAP_PA, hi - lo, r, r1);
++	if (r != 0 || r1 != 0) {
++		return false;
++	}
++	vm_offset_t zap = ml_io_map(ZAP_PA, ZAP_SIZE);
++	if (zap == 0) {
++		return false;
++	}
++	const uint32_t *src = (const uint32_t *)phystokv(seg);
++	for (uint32_t off = 0; off < ((memsz + 3) & ~3u); off += 4) {
++		wr(zap, off, off < seg_len ? src[off / 4] : 0);
++	}
++	/* PAS_AUTH_AND_RESET (svc 2 cmd 5): pas id */
++	r = scm_call(2, 5, 1, GPU_PAS_ID, 0, 0, &r1);
++	printf("SWEET GPU: zap auth_and_reset -> %lld/%llx\n", r, r1);
++	return r == 0 && r1 == 0;
++}
++
++#endif /* !KUGO: the Pixel's zap_load */
++
++/* Source pixel (x, y) of the RGBA8 test pattern, byte c. */
++static uint8_t
++pat(uint32_t x, uint32_t y, uint32_t c)
++{
++	return (uint8_t)(c == 0 ? x * 4 + 1 : c == 1 ? y * 4 + 2 : c == 2 ? (x + y) * 2 + 3 : 0x80);
++}
++
++/* Step 3: three 2D blits (see the header). */
++static void
++blit_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t scratch)
++{
++	vm_offset_t sva, d1va, d2va, d3va;
++	uint64_t src = gpu_page(&sva), d1 = gpu_page(&d1va), d2 = gpu_page(&d2va), d3 = gpu_page(&d3va);
++	if (src == 0 || d1 == 0 || d2 == 0 || d3 == 0) {
++		printf("SWEET GPU: no blit pages\n");
++		return;
++	}
++	uint8_t *s = (uint8_t *)sva, *o1 = (uint8_t *)d1va, *o2 = (uint8_t *)d2va, *o3 = (uint8_t *)d3va;
++	for (uint32_t y = 0; y < 64; y++) {
++		for (uint32_t x = 0; x < 64; x++) {
++			for (uint32_t c = 0; c < 4; c++) {
++				s[y * 256 + x * 4 + c] = pat(x, y, c);
++			}
++		}
++	}
++	flush_dcache64((addr64_t)src, PAGE_SIZE, TRUE);
++	flush_dcache64((addr64_t)d1, PAGE_SIZE, TRUE);
++	flush_dcache64((addr64_t)d2, PAGE_SIZE, TRUE);
++	flush_dcache64((addr64_t)d3, PAGE_SIZE, TRUE);
++	uint64_t fence = scratch + 16;
++	volatile uint32_t *fv = (volatile uint32_t *)(scratch_va + 16);
++	printf("SWEET GPU: blit pages src %llx dst %llx %llx %llx\n", src, d1, d2, d3);
++
++	static const char *const name[3] = {"copy RGBA8 64x64", "RGBA8 -> RGB888 64x64", "scale RGBA8 32x32 -> RGB888 46x46"};
++	for (uint32_t t = 0; t < 3; t++) {
++		gpu_wait(2);
++		wr(smmu + 0x8000, 0x58, 0xffffffffu);   /* CB0 FSR: clear the last blit's fault */
++		if (t == 0) {
++			emit_blit(BLIT_OP_COPY, RB5_R8G8B8A8_UNORM, src, 256, 64, 64,
++			    RB5_R8G8B8A8_UNORM, d1, 256, 64, 64, fence, 0x100 + t);
++		} else if (t == 1) {
++			emit_blit(BLIT_OP_COPY, RB5_R8G8B8A8_UNORM, src, 256, 64, 64,
++			    RB5_R8G8B8_UNORM, d2, 192, 64, 64, fence, 0x100 + t);
++		} else {
++			emit_blit(BLIT_OP_SCALE, RB5_R8G8B8A8_UNORM, src, 256, 32, 32,
++			    RB5_R8G8B8_UNORM, d3, 192, 46, 46, fence, 0x100 + t);
++		}
++		bool read = kick(gpu);
++		delay(5000);
++		flush_dcache64((addr64_t)scratch, 64, TRUE);
++		flush_dcache64((addr64_t)d1, PAGE_SIZE, TRUE);
++		flush_dcache64((addr64_t)d2, PAGE_SIZE, TRUE);
++		flush_dcache64((addr64_t)d3, PAGE_SIZE, TRUE);
++		uint32_t bad = 0, nonzero = 0, first = ~0u;
++		for (uint32_t y = 0; y < 64; y++) {
++			for (uint32_t x = 0; x < 64; x++) {
++				for (uint32_t c = 0; c < 4; c++) {
++					uint32_t got, want;
++					if (t == 0) {
++						got = o1[y * 256 + x * 4 + c];
++						want = pat(x, y, c);
++					} else if (t == 1 && c < 3) {
++						got = o2[y * 192 + x * 3 + c];
++						want = pat(x, y, c);
++					} else if (t == 2 && c < 3 && x < 46 && y < 46) {
++						/* nearest; the GPU may sample at pixel centres, so only count */
++						got = o3[y * 192 + x * 3 + c];
++						want = pat(x * 32 / 46, y * 32 / 46, c);
++					} else {
++						continue;
++					}
++					nonzero += got != 0;
++					if (got != want) {
++						if (bad++ == 0) {
++							first = (y << 16) | (x << 4) | c;
++						}
++					}
++				}
++			}
++		}
++		uint8_t *o = t == 0 ? o1 : t == 1 ? o2 : o3;
++		cp_state(gpu, read ? "blit read:" : "blit NOT read (200 ms):");
++		smmu_faults(smmu, "after blit:");
++		printf("SWEET GPU: blit %s: fence %x (want %x), %u nonzero, %u mismatches (first y %u x %u c %u); "
++		    "dst[0..7] %02x %02x %02x %02x %02x %02x %02x %02x -> %s\n",
++		    name[t], *fv, 0x100 + t, nonzero, bad, first >> 16, (first >> 4) & 0xfff, first & 0xf,
++		    o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7],
++		    bad == 0 ? "GPU 2D BLIT WORKS" : nonzero ? "partly written" : "nothing written");
++		if (!read) {
++			return;
++		}
++	}
++}
++
++/*
++ * GPU VA window 8-16 GB: L1[8..15] -> L2 (512 x 2 MB) -> L3 (512 x 4 KB).
++ * L2/L3 tables are 4 KB, carved from 16 KB pages; L3 tables are allocated
++ * on first use of a 2 MB chunk and kept. Mappings are page (16 KB)
++ * granular, first fit from a rover, each followed by VM_PAD padding pages
++ * that all map one shared scratch page: texture/vertex fetch reads past
++ * buffer ends, and a fault there hung the A530 even with faults
++ * terminated (0154a/c, 0155a), so overruns land in scratch instead.
++ * Mesa makes thousands of small buffers, whole 2 MB chunks ran out at 4096.
++ * g_owner[page] is the mapping index (0 free, VM_GUARD padding).
++ */
++#define GVA_BASE        0x200000000ull
++#define GVA_CHUNKS      4096u                   /* 8 GB / 2 MB */
++#define GVA_PAGES       ((uint32_t)((8ull << 30) / PAGE_SIZE))
++#define VM_MAPS         16384u                  /* index 0 unused */
++#define VM_GUARD        0xffffu
++#define VM_PAD          8u                      /* 128 KB */
++#define PTE_ATTRS       ((1u << 6) | (2u << 8) | (1u << 10))    /* AP[1], SH outer, AF; AttrIndx 0 */
++
++static LCK_GRP_DECLARE(sweet_gpu_grp, "sweet_gpu");
++static LCK_MTX_DECLARE(sweet_gpu_vm_lock, &sweet_gpu_grp);
++static vm_offset_t g_smmu;
++static uint64_t *g_l2[8];
++static uint64_t *g_l3[GVA_CHUNKS];
++struct vm_mapping {
++	uint64_t va;            /* 0: free slot */
++	uint64_t *pa;           /* npages physical page addresses */
++	uint32_t npages;
++	bool ro;
++};
++static struct vm_mapping *g_maps;
++static uint16_t *g_owner;
++static uint32_t g_rover, g_map_rover = 1;
++static uint64_t g_pad_pa[VM_PAD];               /* VM_PAD x the scratch page */
++
++/* A 4 KB table from the current 16 KB pool page; *pa gets its PA. */
++static uint64_t *
++pt4k(uint64_t *pa)
++{
++	static vm_offset_t pool_va;
++	static uint64_t pool_pa;
++	static unsigned pool_left;
++	if (pool_left == 0) {
++		pool_pa = gpu_page(&pool_va);
++		if (pool_pa == 0) {
++			return NULL;
++		}
++		pool_left = PAGE_SIZE / 4096;
++	}
++	unsigned i = PAGE_SIZE / 4096 - pool_left--;
++	*pa = pool_pa + i * 4096;
++	return (uint64_t *)(pool_va + i * 4096);
++}
++
++static void
++smmu_tlb_flush(void)
++{
++	wr(g_smmu, 0x68, 0);    /* TLBIALLNSNH */
++	wr(g_smmu, 0x70, 0);    /* sTLBGSYNC */
++	(void)poll(g_smmu, 0x74, 1u, 0, 10);
++}
++
++static bool
++vm_init(vm_offset_t smmu)
++{
++	g_smmu = smmu;
++	g_maps = kalloc_data(VM_MAPS * sizeof(g_maps[0]), Z_WAITOK | Z_ZERO);
++	g_owner = kalloc_data(GVA_PAGES * sizeof(g_owner[0]), Z_WAITOK | Z_ZERO);
++	vm_offset_t pad_va;
++	uint64_t pad = gpu_page(&pad_va);
++	if (g_maps == NULL || g_owner == NULL || pad == 0) {
++		return false;
++	}
++	for (unsigned i = 0; i < VM_PAD; i++) {
++		g_pad_pa[i] = pad;
++	}
++	for (unsigned gb = 0; gb < 8; gb++) {
++		uint64_t pa;
++		g_l2[gb] = pt4k(&pa);
++		if (g_l2[gb] == NULL) {
++			return false;
++		}
++		g_l1[8 + gb] = pa | 3u;                 /* table */
++	}
++	flush_dcache64((addr64_t)g_l1_pa, 4096, TRUE);
++	smmu_tlb_flush();
++	return true;
++}
++
++/* VM lock held: first page of a free run of n pages (first fit from the rover), or -1. */
++static int64_t
++vm_find(uint32_t n)
++{
++	for (int pass = 0; pass < 2; pass++) {
++		uint32_t start = pass ? 0 : g_rover, end = pass ? g_rover : GVA_PAGES;
++		uint32_t run = 0;
++		for (uint32_t p = start; p < end; p++) {
++			run = g_owner[p] ? 0 : run + 1;
++			if (run == n) {
++				return p + 1 - n;
++			}
++		}
++	}
++	return -1;
++}
++
++/* VM lock held: L3 tables for pages [first, first + n). */
++static bool
++vm_tables(uint32_t first, uint32_t n)
++{
++	uint32_t per = (2u << 20) / PAGE_SIZE;          /* pages per 2 MB chunk */
++	for (uint32_t c = first / per; c <= (first + n - 1) / per; c++) {
++		if (g_l3[c] != NULL) {
++			continue;
++		}
++		uint64_t l3pa;
++		g_l3[c] = pt4k(&l3pa);
++		if (g_l3[c] == NULL) {
++			return false;
++		}
++		bzero(g_l3[c], 4096);
++		flush_dcache64((addr64_t)g_l3[c], 4096, FALSE);
++		uint64_t *l2 = g_l2[c / 512];
++		l2[c % 512] = l3pa | 3u;
++		flush_dcache64((addr64_t)&l2[c % 512], 8, FALSE);
++	}
++	return true;
++}
++
++/* VM lock held: write (pa != NULL) or clear the L3 entries of pages [first, first + n). */
++static void
++vm_ptes(uint32_t first, uint32_t n, const uint64_t *pa, bool readonly)
++{
++	uint32_t sub = PAGE_SIZE / 4096;
++	uint64_t attrs = PTE_ATTRS | (readonly ? 1u << 7 : 0);         /* AP[2]: read-only */
++	uint64_t i0 = (uint64_t)first * sub, i1 = (uint64_t)(first + n) * sub;
++	for (uint64_t i = i0; i < i1; i++) {
++		g_l3[i / 512][i % 512] = pa ? (pa[i / sub - first] + (i % sub) * 4096) | 3u | attrs : 0;
++	}
++	for (uint64_t t = i0 / 512; t <= (i1 - 1) / 512; t++) {
++		flush_dcache64((addr64_t)g_l3[t], 4096, FALSE);
++	}
++}
++
++/*
++ * Map npages kernel pages (16 KB each, physical addresses in pa[]) at a new
++ * GPU VA; returns it, or 0 if out of VA, slots or table memory.
++ */
++uint64_t
++sweet_gpu_vm_map(const uint64_t *pa, uint32_t npages, bool readonly)
++{
++	if (g_maps == NULL || npages == 0 || npages >= GVA_PAGES) {
++		return 0;
++	}
++	uint64_t *pages = kalloc_data(npages * sizeof(uint64_t), Z_WAITOK);
++	if (pages == NULL) {
++		return 0;
++	}
++	memcpy(pages, pa, npages * sizeof(uint64_t));
++	lck_mtx_lock(&sweet_gpu_vm_lock);
++	uint32_t m = 0;
++	for (uint32_t k = 0; k < VM_MAPS - 1 && m == 0; k++) {
++		uint32_t i = 1 + (g_map_rover - 1 + k) % (VM_MAPS - 1);
++		m = g_maps[i].va == 0 ? i : 0;
++	}
++	int64_t first = m ? vm_find(npages + VM_PAD) : -1;
++	if (first < 0 || !vm_tables((uint32_t)first, npages + VM_PAD)) {
++		lck_mtx_unlock(&sweet_gpu_vm_lock);
++		kfree_data(pages, npages * sizeof(uint64_t));
++		return 0;
++	}
++	for (uint32_t p = 0; p < npages; p++) {
++		g_owner[first + p] = (uint16_t)m;
++	}
++	for (uint32_t p = 0; p < VM_PAD; p++) {
++		g_owner[first + npages + p] = VM_GUARD;
++	}
++	g_rover = (uint32_t)first + npages + VM_PAD;
++	g_map_rover = m + 1;
++	uint64_t va = GVA_BASE + (uint64_t)first * PAGE_SIZE;
++	g_maps[m] = (struct vm_mapping){ .va = va, .pa = pages, .npages = npages, .ro = readonly };
++	vm_ptes((uint32_t)first, npages, pages, readonly);
++	vm_ptes((uint32_t)first + npages, VM_PAD, g_pad_pa, false);
++	smmu_tlb_flush();
++	lck_mtx_unlock(&sweet_gpu_vm_lock);
++	return va;
++}
++
++void
++sweet_gpu_vm_unmap(uint64_t va)
++{
++	if (g_maps == NULL || va < GVA_BASE || va - GVA_BASE >= (uint64_t)GVA_PAGES * PAGE_SIZE || (va & PAGE_MASK)) {
++		return;
++	}
++	uint32_t first = (uint32_t)((va - GVA_BASE) / PAGE_SIZE);
++	lck_mtx_lock(&sweet_gpu_vm_lock);
++	uint32_t m = g_owner[first];
++	if (m == 0 || m == VM_GUARD || g_maps[m].va != va) {
++		lck_mtx_unlock(&sweet_gpu_vm_lock);
++		return;
++	}
++	uint32_t n = g_maps[m].npages;
++	uint64_t *pages = g_maps[m].pa;
++	vm_ptes(first, n + VM_PAD, NULL, false);
++	smmu_tlb_flush();
++	for (uint32_t p = 0; p < n + VM_PAD; p++) {
++		g_owner[first + p] = 0;
++	}
++	g_maps[m] = (struct vm_mapping){ 0 };
++	lck_mtx_unlock(&sweet_gpu_vm_lock);
++	kfree_data(pages, n * sizeof(uint64_t));
++}
++
++/* VM lock held: the index of the one mapping holding [va, va + len), or -1. */
++static int
++vm_range(uint64_t va, uint64_t len)
++{
++	if (g_maps == NULL || len == 0 || va < GVA_BASE || va - GVA_BASE >= (uint64_t)GVA_PAGES * PAGE_SIZE) {
++		return -1;
++	}
++	uint32_t m = g_owner[(va - GVA_BASE) / PAGE_SIZE];
++	if (m == 0 || m == VM_GUARD) {
++		return -1;
++	}
++	uint64_t end = g_maps[m].va + (uint64_t)g_maps[m].npages * PAGE_SIZE;
++	return len <= end - va ? (int)m : -1;
++}
++
++/* VM lock held: clean + invalidate the CPU cache over [va, va + len) of mapping m. */
++static void
++vm_cache(uint32_t m, uint64_t va, uint64_t len)
++{
++	uint64_t off = va - g_maps[m].va;
++	for (uint64_t p = off / PAGE_SIZE; p <= (off + len - 1) / PAGE_SIZE; p++) {
++		/* not kernel RAM (the panel buffers): no physmap alias, nothing cached */
++		if (pmap_valid_page((ppnum_t)atop(g_maps[m].pa[p]))) {
++			flush_dcache64((addr64_t)g_maps[m].pa[p], PAGE_SIZE, TRUE);
++		}
++	}
++}
++
++/* Optional dispatch state: constants, textures + samplers, 2-D grid. */
++struct cs_extra {
++	const uint32_t *consts;         /* nconst vec4s, uploaded at c0 */
++	uint32_t nconst;
++	const uint32_t *tex;            /* ntex x 12 dwords (A5XX_TEX_CONST) */
++	const uint32_t *samp;           /* ntex x 4 dwords (A5XX_TEX_SAMP) */
++	uint32_t ntex;
++	uint32_t groups_y;              /* 0 = 1 */
++};
++
++/* A5XX_TEX_CONST for a linear 2-D image: TFMT5_* format, swizzle (4 x 3 bits, x first). */
++static void
++tex_desc(uint32_t *t, uint64_t pa, uint32_t w, uint32_t h, uint32_t pitch, uint32_t fmt, uint32_t swiz)
++{
++	memset(t, 0, 12 * 4);
++	t[0] = ((swiz & 7) << 4) | (((swiz >> 3) & 7) << 7) | (((swiz >> 6) & 7) << 10) | (((swiz >> 9) & 7) << 13) |
++	    (fmt << 22);
++	t[1] = w | (h << 15);
++	t[2] = (pitch << 7) | (1u << 29);                       /* PITCHALIGN 0, 2D */
++	t[3] = ((pitch * h) >> 12) & 0x3fff;                    /* ARRAY_PITCH */
++	t[4] = (uint32_t)pa;                                    /* 32-byte aligned */
++	t[5] = (uint32_t)(pa >> 32) | (1u << 17);               /* DEPTH 1 */
++}
++
++#define TFMT5_8_UNORM           0x03u
++#define TFMT5_8_8_UNORM         0x0fu
++#define TFMT5_8_8_8_8_UNORM     0x30u
++#define SWIZ_XYZW               0x688u
++
++/* A linear RGBA8 2-D image (byte 0 = x). */
++static void
++tex_rgba8(uint32_t *t, uint64_t pa, uint32_t w, uint32_t h, uint32_t pitch)
++{
++	tex_desc(t, pa, w, h, pitch, TFMT5_8_8_8_8_UNORM, SWIZ_XYZW);
++}
++
++/* A5XX_TEX_SAMP: unnormalized coords, clamp to edge, linear or nearest. */
++static void
++samp_unnorm(uint32_t *s, bool linear)
++{
++	uint32_t f = linear ? 1 : 0;
++	s[0] = (f << 1) | (f << 3) | (1u << 5) | (1u << 8) | (1u << 11);
++	s[1] = (1u << 5) | (32u << 8);                         /* UNNORM, MAX_LOD 0.125 */
++	s[2] = 0;
++	s[3] = 0;
++}
++
++/*
++ * One compute dispatch of `groups` x k->local[0] invocations (computerator
++ * a5xx_emit_grid: cs_restore_emit, cs_program_emit, cs_ibo_emit; no consts,
++ * no private memory); the shader binary must already be at shader_pa. Ends
++ * with CACHE_FLUSH_TS writing seq to fence. True if the CP read it all.
++ */
++static bool
++compute_run(vm_offset_t gpu, const struct sweet_kernel *k, uint64_t shader_pa,
++    const uint64_t *buf, const uint32_t *buf_bytes, uint32_t groups, uint64_t fence, uint32_t seq,
++    const struct cs_extra *x)
++{
++	uint32_t gy = x && x->groups_y ? x->groups_y : 1;
++	uint32_t thr = k->double_threadsize ? 1 : 0;     /* FOUR_QUADS : TWO_QUADS */
++
++	/* cs_restore_emit */
++	emit(pkt7(CP_SET_RENDER_MODE, 5)); emit(BYPASS); emit(0); emit(0); emit(0); emit(0);
++	emit(pkt4(R_UCHE_CACHE_INVALIDATE_MIN, 5)); emit(0); emit(0); emit(0); emit(0); emit(0x12);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	emit(pkt4(R_HLSQ_UPDATE_CNTL, 1)); emit(0x000fffff);
++	emit(pkt4(R_RB_MODE_CNTL, 1)); emit(0x44);
++	emit(pkt4(R_RB_DBG_ECO_CNTL, 1)); emit(0x00100000);
++	emit(pkt4(R_PC_MODE_CNTL, 1)); emit(0x1f);
++	emit(pkt4(R_SP_MODE_CNTL, 1)); emit(0x1e);
++	emit(pkt4(R_SP_DBG_ECO_CNTL, 1)); emit(0x40000800);     /* not A540 */
++	emit(pkt4(R_TPL1_MODE_CNTL, 1)); emit(0x544);
++	emit(pkt4(R_HLSQ_TIMEOUT_THRESHOLD_0, 2)); emit(0x80); emit(0);
++	emit(pkt4(R_VPC_DBG_ECO_CNTL, 1)); emit(0x400);
++	emit(pkt4(R_HLSQ_MODE_CNTL, 1)); emit(1);
++	emit(pkt4(R_VPC_MODE_CNTL, 1)); emit(0);
++	/* cs_program_emit */
++	emit(pkt4(R_SP_SP_CNTL, 1)); emit(0);
++	emit(pkt4(R_HLSQ_CONTROL_0_REG, 1)); emit((thr << 2) | 0x880);
++	emit(pkt4(R_SP_CS_CTRL_REG0, 1));
++	emit((thr << 3) | ((uint32_t)(k->max_half_reg + 1) << 4) | ((uint32_t)(k->max_reg + 1) << 10) |
++	    (k->branchstack << 24) | (1u << 2) /* BUFFER */ | 0x2);
++	emit(pkt4(R_HLSQ_CS_CONFIG, 1)); emit(1);
++	emit(pkt4(R_HLSQ_CS_CNTL, 1)); emit((k->instrlen << 1) | (k->num_bufs ? 1u : 0));
++	emit(pkt4(R_SP_CS_CONFIG, 1)); emit(1);
++	emit(pkt4(R_HLSQ_CS_CONSTLEN, 2)); emit(k->constlen / 4); emit(k->instrlen);
++	emit(pkt4(R_TPL1_CS_TEX_COUNT, 1)); emit(x ? x->ntex : 0);
++	emit(pkt4(R_SP_CS_OBJ_START, 6));
++	emit((uint32_t)shader_pa); emit((uint32_t)(shader_pa >> 32));
++	emit(0);                                /* PVT_MEM_PARAM */
++	emit(0); emit(0);                       /* PVT_MEM_ADDR */
++	emit(0);                                /* PVT_MEM_SIZE */
++	emit(pkt4(R_HLSQ_UPDATE_CNTL, 1)); emit(0x01f00000);
++	emit(pkt4(R_HLSQ_CS_CNTL_0, 2));
++	emit(k->wgid_regid | (0xfcu << 8) | (0xfcu << 16) | (k->localid_regid << 24));
++	emit(1);                                /* HLSQ_CS_CNTL_1 */
++	emit(pkt7(CP_LOAD_STATE4, 3));
++	emit((2u << 16) | (SB4_CS_SHADER << 18) | (k->instrlen << 22));    /* SS4_INDIRECT */
++	emit((uint32_t)shader_pa);              /* STATE_TYPE ST4_SHADER (0) in bits 1:0 */
++	emit((uint32_t)(shader_pa >> 32));
++	/* constants (computerator emit_const), textures + samplers (fd5 emit_textures) */
++	if (x && x->nconst) {
++		emit(pkt7(CP_LOAD_STATE4, 3 + 4 * x->nconst));
++		emit((SB4_CS_SHADER << 18) | (x->nconst << 22));       /* SS4_DIRECT, DST_OFF 0 */
++		emit(1);                                                /* ST4_CONSTANTS */
++		emit(0);
++		for (uint32_t i = 0; i < 4 * x->nconst; i++) {
++			emit(x->consts[i]);
++		}
++	}
++	if (x && x->ntex) {
++		emit(pkt7(CP_LOAD_STATE4, 3 + 4 * x->ntex));
++		emit((SB4_CS_TEX << 18) | (x->ntex << 22));
++		emit(0);                                                /* ST4_SHADER = samplers */
++		emit(0);
++		for (uint32_t i = 0; i < 4 * x->ntex; i++) {
++			emit(x->samp[i]);
++		}
++		emit(pkt7(CP_LOAD_STATE4, 3 + 12 * x->ntex));
++		emit((SB4_CS_TEX << 18) | (x->ntex << 22));
++		emit(1);                                                /* ST4_CONSTANTS = textures */
++		emit(0);
++		for (uint32_t i = 0; i < 12 * x->ntex; i++) {
++			emit(x->tex[i]);
++		}
++		emit(pkt4(R_TPL1_VS_TEX_COUNT, 4)); emit(0); emit(0); emit(0); emit(0);
++		emit(pkt4(R_TPL1_FS_TEX_COUNT, 1)); emit(0);
++	}
++	/* cs_ibo_emit: SSBO sizes (bytes, overflowing from WIDTH into HEIGHT), then addresses */
++	if (k->num_bufs) {
++		emit(pkt7(CP_LOAD_STATE4, 3 + 2 * k->num_bufs));
++		emit((SB4_CS_SSBO << 18) | (k->num_bufs << 22));
++		emit(1);                        /* ST4_CONSTANTS */
++		emit(0);
++		for (uint32_t i = 0; i < k->num_bufs; i++) {
++			emit((buf_bytes[i] & 0xffffu) << 16);
++			emit(buf_bytes[i] >> 16);
++		}
++		emit(pkt7(CP_LOAD_STATE4, 3 + 2 * k->num_bufs));
++		emit((SB4_CS_SSBO << 18) | (k->num_bufs << 22));
++		emit(2);                        /* ST4_UBO */
++		emit(0);
++		for (uint32_t i = 0; i < k->num_bufs; i++) {
++			emit((uint32_t)buf[i]); emit((uint32_t)(buf[i] >> 32));
++		}
++	}
++	/* grid: groups x gy workgroups */
++	emit(pkt4(R_HLSQ_CS_NDRANGE_0, 7));
++	emit(3u | ((k->local[0] - 1) << 2) | ((k->local[1] - 1) << 12) | ((k->local[2] - 1) << 22));
++	emit(k->local[0] * groups); emit(0);
++	emit(k->local[1] * gy); emit(0);
++	emit(k->local[2]); emit(0);
++	emit(pkt4(R_HLSQ_CS_KERNEL_GROUP_X, 3)); emit(1); emit(1); emit(1);
++	emit(pkt7(CP_EXEC_CS, 4)); emit(0); emit(groups); emit(gy); emit(1);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	emit(pkt7(CP_EVENT_WRITE, 4)); emit(CACHE_FLUSH_TS);
++	emit((uint32_t)fence); emit((uint32_t)(fence >> 32)); emit(seq);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	return kick(gpu);
++}
++
++/* A kernel's binary in its own page; returns the PA (0 on failure). */
++static uint64_t
++kernel_page(const struct sweet_kernel *k)
++{
++	vm_offset_t va;
++	uint64_t pa = gpu_page(&va);
++	if (pa != 0 && k->size <= PAGE_SIZE) {
++		memcpy((void *)va, k->bin, k->size);
++		flush_dcache64((addr64_t)pa, PAGE_SIZE, TRUE);
++	}
++	return k->size <= PAGE_SIZE ? pa : 0;
++}
++
++/* CPU reference of blend.asm: premultiplied source-over, same rounding. */
++static uint32_t
++blend_ref(uint32_t src, uint32_t dst)
++{
++	uint32_t ia = 255 - (src >> 24), out = 0;
++	for (int sh = 0; sh < 32; sh += 8) {
++		uint32_t t = ((dst >> sh) & 0xff) * ia;
++		out |= (((t + 128 + (t >> 8)) >> 8) & 0xff) << sh;
++	}
++	return src + out;
++}
++
++static uint64_t
++usecs(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / 1000;
++}
++
++/* CPU blend as fast as plain C gets: blend.asm's two-channels-per-op form. */
++static void
++blend_cpu(const uint32_t *src, uint32_t *dst, uint32_t n)
++{
++	for (uint32_t i = 0; i < n; i++) {
++		uint32_t s = src[i], d = dst[i], ia = 255 - (s >> 24);
++		uint32_t rb = (d & 0x00ff00ffu) * ia, ag = ((d >> 8) & 0x00ff00ffu) * ia;
++		rb = ((rb + 0x00800080u + ((rb >> 8) & 0x00ff00ffu)) >> 8) & 0x00ff00ffu;
++		ag = ((ag + 0x00800080u + ((ag >> 8) & 0x00ff00ffu)) >> 8) & 0x00ff00ffu;
++		dst[i] = s + (rb | (ag << 8));
++	}
++}
++
++/* gfx3d RCG = GPLL0 (600 MHz) / div, div in half steps (field 2*div - 1). */
++static bool
++gfx_clock(uint32_t field)
++{
++#if defined(KUGO)
++	/* GPLL0 800 MHz: field 2*div-1; the Pixel's 300 MHz (3) becomes 266 MHz (div 3 = 5) */
++	uint32_t f = field == 3 ? 5u : field == 5 ? 7u : field;
++	wr(mmcc, G_GFX3D_CFG, (1u << 8) | f);
++	wr(mmcc, G_GFX3D_CMD, rd(mmcc, G_GFX3D_CMD) | 1u);
++	return poll(mmcc, G_GFX3D_CMD, 1u, 0, 10);
++#else
++	wr(mmcc, 0x4004, (5u << 8) | field);
++	wr(mmcc, 0x4000, rd(mmcc, 0x4000) | 1u);
++	return poll(mmcc, 0x4000, 1u, 0, 10);
++#endif
++}
++
++/*
++ * Full-frame benchmark: 1024x1024 pixels (4 MB per buffer, about one
++ * 750x1334 iOS frame), each configuration twice.
++ */
++static void
++bench_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t scratch)
++{
++	const uint32_t n = 1024 * 1024, bytes = n * 4;
++	vm_offset_t sva, dva, cva;
++	uint64_t src = gpu_alloc(&sva, bytes), dst = gpu_alloc(&dva, bytes), cpu = gpu_alloc(&cva, bytes);
++	uint64_t kb = kernel_page(&k_blend), kb4 = kernel_page(&k_blend4);
++	if (src == 0 || dst == 0 || cpu == 0 || kb == 0 || kb4 == 0) {
++		printf("SWEET GPU: bench: no 4 MB buffers\n");
++		return;
++	}
++	static const struct {
++		const char *name;
++		const struct sweet_kernel *k;
++		uint32_t px_per_inv, clk_field, mhz;
++	} cfg[3] = {
++		{"blend 1px", &k_blend, 1, 5, 200},
++		{"blend4 4px", &k_blend4, 4, 5, 200},
++		{"blend4 4px", &k_blend4, 4, 3, 300},
++	};
++	uint32_t *s = (uint32_t *)sva, *d = (uint32_t *)dva, *c = (uint32_t *)cva;
++	volatile uint32_t *fv = (volatile uint32_t *)(scratch_va + 48);
++	for (uint32_t r = 0; r < 6; r++) {
++		uint32_t ci = r / 2, seq = 0x500 + r;
++		if (r % 2 == 0 && !gfx_clock(cfg[ci].clk_field)) {
++			printf("SWEET GPU: bench: gfx3d clock switch to %u MHz TIMEOUT\n", cfg[ci].mhz);
++			return;
++		}
++		for (uint32_t i = 0; i < n; i++) {
++			uint32_t al = (i * 37 + r) & 0xff, ch = al ? (i * 11) % (al + 1) : 0;
++			s[i] = (al << 24) | (ch << 16) | ((ch / 2) << 8) | (ch / 3);
++			d[i] = c[i] = 0xff000000u | ((i * 7) & 0xff) << 16 | ((i * 13) & 0xff) << 8 | (i & 0xff);
++		}
++		uint64_t t0 = mach_absolute_time();
++		flush_dcache64((addr64_t)src, bytes, TRUE);
++		flush_dcache64((addr64_t)dst, bytes, TRUE);
++		uint64_t t1 = mach_absolute_time();
++		uint64_t bufs[2] = {src, dst};
++		uint32_t sizes[2] = {bytes, bytes};
++		bool read = compute_run(gpu, cfg[ci].k, ci == 0 ? kb : kb4, bufs, sizes,
++		    n / cfg[ci].px_per_inv / 64, scratch + 48, seq, NULL);
++		uint64_t t2 = mach_absolute_time();
++		bool done = false;
++		for (unsigned us = 0; us < 500000 && !(done = (*fv == seq)); us += 10) {
++			delay(10);
++			flush_dcache64((addr64_t)scratch + 48, 4, TRUE);
++		}
++		uint64_t t3 = mach_absolute_time();
++		flush_dcache64((addr64_t)dst, bytes, TRUE);
++		uint64_t t4 = mach_absolute_time();
++		blend_cpu(s, c, n);
++		uint64_t t5 = mach_absolute_time();
++		uint32_t bad = 0, first = ~0u;
++		for (uint32_t i = 0; i < n; i++) {
++			if (d[i] != c[i] && bad++ == 0) {
++				first = i;
++			}
++		}
++		printf("SWEET GPU: bench %u %s @%u MHz: %u px; cache clean+inval 8 MB %llu us; GPU submit %llu us, "
++		    "submit->fence %llu us (%s); inval 4 MB %llu us; CPU blend %llu us; GPU vs CPU %u wrong (first %u)\n",
++		    r, cfg[ci].name, cfg[ci].mhz, n, usecs(t1 - t0), usecs(t2 - t1), usecs(t3 - t1),
++		    done ? "done" : read ? "NO FENCE" : "NOT READ", usecs(t4 - t3), usecs(t5 - t4), bad, first);
++		smmu_faults(smmu, "after bench:");
++		if (!done) {
++			cp_state(gpu, "bench stuck:");
++			return;
++		}
++		gpu_wait(1);
++	}
++	(void)gfx_clock(5);
++}
++
++/* RGBA8 test image pixel (premultiplied: every channel <= alpha). */
++static uint32_t
++src_px(uint32_t x, uint32_t y)
++{
++	uint32_t al = (x * 9 + y * 5 + 40) & 0xff, c = al ? (x * 7 + y * 3) % (al + 1) : 0;
++	return (al << 24) | (c << 16) | ((c / 2) << 8) | (c / 3);
++}
++
++/*
++ * sample.asm checks. A: identity placement of a 64x64 image at (16, 16) in a
++ * 128x128 dst, opacity 1 (expect blend_ref, +-1 for float rounding).
++ * B: 2x upscale over the whole dst, opacity 0.5: bilinear weights are
++ * quarters, so out = (sum16 * 255 + d * (8160 - sum16_a)) / 8160 exactly in
++ * integers (sum16 = 16x the bilinear sum; 8160 = 255 * 32); expect +-2.
++ */
++/* Kernel memory from kernel_memory_allocate (pages not contiguous), mapped at a GPU VA. */
++static uint64_t
++vm_buffer(vm_offset_t *va, uint32_t bytes)
++{
++	uint64_t pa[16];
++	uint32_t npages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
++	if (npages > 16 || kmem_alloc(kernel_map, va, npages * PAGE_SIZE, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return 0;
++	}
++	bool contiguous = true;
++	for (uint32_t i = 0; i < npages; i++) {
++		pa[i] = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)(*va + i * PAGE_SIZE)));
++		contiguous = contiguous && (i == 0 || pa[i] == pa[i - 1] + PAGE_SIZE);
++	}
++	uint64_t gva = sweet_gpu_vm_map(pa, npages, false);
++	printf("SWEET GPU: vm buffer %u pages (%s) pa[0] %llx pa[1] %llx -> GPU VA %llx\n", npages,
++	    contiguous ? "contiguous" : "scattered", pa[0], npages > 1 ? pa[1] : 0, gva);
++	return gva;
++}
++
++static void
++sample_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t scratch, bool vm)
++{
++	const uint32_t W = 128, H = 128, SW = 64, SH = 64;
++	vm_offset_t sva, dva;
++	uint64_t ks = kernel_page(&k_sample), src, dst;
++	if (vm) {
++		src = vm_buffer(&sva, SW * SH * 4);
++		dst = vm_buffer(&dva, W * H * 4);
++	} else {
++		src = gpu_page(&sva);
++		dst = gpu_alloc(&dva, W * H * 4);
++	}
++	if (src == 0 || dst == 0 || ks == 0) {
++		printf("SWEET GPU: sample: no pages\n");
++		return;
++	}
++	uint32_t *s = (uint32_t *)sva, *d = (uint32_t *)dva;
++	volatile uint32_t *fv = (volatile uint32_t *)(scratch_va + 56);
++	for (uint32_t y = 0; y < SH; y++) {
++		for (uint32_t x = 0; x < SW; x++) {
++			s[y * SW + x] = src_px(x, y);
++		}
++	}
++	for (uint32_t t = 0; t < 2; t++) {
++		for (uint32_t i = 0; i < W * H; i++) {
++			d[i] = 0xff000000u | ((i * 7) & 0xff) << 16 | ((i * 13) & 0xff) << 8 | (i & 0xff);
++		}
++		uint32_t orig_d0 = d[0];
++		flush_dcache64((addr64_t)sva, SW * SH * 4, FALSE);
++		flush_dcache64((addr64_t)dva, W * H * 4, FALSE);
++		/* floats as bits: 1.0 3f800000, 0.5 3f000000, 255.0 437f0000, -16.0 c1800000 */
++		uint32_t x0 = t == 0 ? 16 : 0, y0 = x0, w = t == 0 ? SW : W, h = t == 0 ? SH : H;
++		uint32_t consts[16] = {
++			t == 0 ? 0x3f800000u : 0x3f000000u, 0, 0, t == 0 ? 0x3f800000u : 0x3f000000u,
++			t == 0 ? 0xc1800000u : 0, t == 0 ? 0xc1800000u : 0, t == 0 ? 0x3f800000u : 0x3f000000u, 0x3f800000u,
++			0x437f0000u, 0x3f000000u, w - 1, W,
++			x0, y0, 0x3f800000u, 0x3f800000u,  /* source-over */
++		};
++		uint32_t tex[24], samp[8];
++		tex_rgba8(tex, src, SW, SH, SW * 4);
++		tex_rgba8(tex + 12, dst, W, H, W * 4);
++		samp_unnorm(samp, true);
++		samp_unnorm(samp + 4, false);
++		struct cs_extra x = {consts, 4, tex, samp, 2, h};
++		uint64_t bufs[1] = {dst};
++		uint32_t sizes[1] = {W * H * 4};
++		wr(smmu + 0x8000, 0x58, 0xffffffffu);
++		bool read = compute_run(gpu, &k_sample, ks, bufs, sizes, (w + 63) / 64, scratch + 56, 0x600 + t, &x);
++		delay(5000);
++		flush_dcache64((addr64_t)scratch, 64, TRUE);
++		flush_dcache64((addr64_t)dva, W * H * 4, FALSE);
++		uint32_t bad = 0, first = ~0u, maxdiff = 0, want_first = 0;
++		for (uint32_t py = 0; py < H; py++) {
++			for (uint32_t px = 0; px < W; px++) {
++				uint32_t i = py * W + px;
++				uint32_t dd = 0xff000000u | ((i * 7) & 0xff) << 16 | ((i * 13) & 0xff) << 8 | (i & 0xff);
++				uint32_t want;
++				if (t == 0) {
++					bool in = px >= x0 && px < x0 + w && py >= y0 && py < y0 + h;
++					want = in ? blend_ref(src_px(px - x0, py - y0), dd) : dd;
++				} else {
++					/* texel pairs and quarter weights along each axis, clamped */
++					int ax = (px & 1) ? (int)(px / 2) : (int)(px / 2) - 1, ay = (py & 1) ? (int)(py / 2) : (int)(py / 2) - 1;
++					uint32_t wx0 = (px & 1) ? 3 : 1, wy0 = (py & 1) ? 3 : 1;
++					int xs[2] = {ax < 0 ? 0 : ax, ax + 1 > (int)SW - 1 ? (int)SW - 1 : ax + 1};
++					int ys[2] = {ay < 0 ? 0 : ay, ay + 1 > (int)SH - 1 ? (int)SH - 1 : ay + 1};
++					uint32_t wxs[2] = {wx0, 4 - wx0}, wys[2] = {wy0, 4 - wy0}, sum[4] = {0, 0, 0, 0};
++					for (int j = 0; j < 2; j++) {
++						for (int k2 = 0; k2 < 2; k2++) {
++							uint32_t p = src_px((uint32_t)xs[k2], (uint32_t)ys[j]);
++							for (int c = 0; c < 4; c++) {
++								sum[c] += wys[j] * wxs[k2] * ((p >> (8 * c)) & 0xff);
++							}
++						}
++					}
++					want = 0;
++					for (int c = 0; c < 4; c++) {
++						uint32_t dc = (dd >> (8 * c)) & 0xff;
++						uint32_t v = (sum[c] * 255 + dc * (8160 - sum[3]) + 4080) / 8160;
++						want |= (v > 255 ? 255 : v) << (8 * c);
++					}
++				}
++				uint32_t got = d[i], md = 0;
++				for (int c = 0; c < 4; c++) {
++					int df = (int)((got >> (8 * c)) & 0xff) - (int)((want >> (8 * c)) & 0xff);
++					uint32_t a = (uint32_t)(df < 0 ? -df : df);
++					md = a > md ? a : md;
++				}
++				maxdiff = md > maxdiff ? md : maxdiff;
++				if (md > (t == 0 ? 1u : 2u) && bad++ == 0) {
++					first = i;
++					want_first = want;
++				}
++			}
++		}
++		cp_state(gpu, read ? "sample read:" : "sample NOT read (200 ms):");
++		smmu_faults(smmu, "after sample:");
++		printf("SWEET GPU: sample%s %s: fence %x (want %x), max channel diff %u, %u bad (first [%u] = %08x want %08x, "
++		    "d[0] %08x was %08x) -> %s\n", vm ? " (GPU VA)" : "", t == 0 ? "A identity 64x64 at (16,16)" : "B 2x upscale, opacity 0.5",
++		    *fv, 0x600 + t, maxdiff, bad, first, first < W * H ? d[first] : 0, want_first, d[0], orig_d0,
++		    bad == 0 ? "GPU TEXTURED QUAD MATCHES THE CPU" : "wrong");
++		if (!read) {
++			return;
++		}
++		gpu_wait(1);
++	}
++}
++
++/* Service mode (sweetgpu=8). */
++static bool g_ready;
++static vm_offset_t g_gpu, g_scratch_va;
++static uint64_t g_scratch, g_ksample4;
++static uint32_t g_seq = 0x10000;
++
++bool
++sweet_gpu_ready(void)
++{
++	return g_ready;
++}
++
++static uint32_t rb_free(void);
++
++int
++sweet_gpu_quad(const struct sweet_gpu_quad *q)
++{
++	if (!g_ready) {
++		return ENXIO;
++	}
++	static const uint32_t fmt_bpp[3] = {4, 1, 2}, fmt_code[3] = {TFMT5_8_8_8_8_UNORM, TFMT5_8_UNORM, TFMT5_8_8_UNORM};
++	uint32_t swiz = q->src_swiz;
++	bool swiz_ok = (swiz >> 12) == 0;
++	for (int c = 0; c < 4; c++) {
++		swiz_ok = swiz_ok && ((swiz >> (3 * c)) & 7) <= 5;
++	}
++	if (q->src_fmt > SWEET_GPU_FMT_RG8 || !swiz_ok || q->nedges > 4 ||
++	    q->src_w == 0 || q->src_h == 0 || q->src_w > 16384 || q->src_h > 16384 ||
++	    q->dst_w == 0 || q->dst_h == 0 || q->dst_w > 16384 || q->dst_h > 16384 ||
++	    q->src_pitch % 64 || q->dst_pitch % 64 || q->src_pitch < q->src_w * fmt_bpp[q->src_fmt] ||
++	    q->dst_pitch < q->dst_w * 4 ||
++	    (q->src_va & 63) || (q->dst_va & 63) || q->w == 0 || q->h == 0 ||
++	    q->x0 >= q->dst_w || q->y0 >= q->dst_h || q->w > q->dst_w - q->x0 || q->h > q->dst_h - q->y0 ||
++	    (q->flags & ~7u) || (q->flags & 6u) == 6u) {
++		return EINVAL;
++	}
++	uint64_t slen = (uint64_t)q->src_pitch * q->src_h, dlen = (uint64_t)q->dst_pitch * q->dst_h;
++	if (slen > 0xffffffffu || dlen > 0xffffffffu) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_gpu_vm_lock);       /* keeps both mappings alive, serializes the ring */
++	int sf = vm_range(q->src_va, slen), df = vm_range(q->dst_va, dlen);
++	if (sf < 0 || df < 0 || g_maps[df].ro) {
++		lck_mtx_unlock(&sweet_gpu_vm_lock);
++		return EFAULT;
++	}
++	if (!g_ready) {                 /* went off while we waited for the lock */
++		lck_mtx_unlock(&sweet_gpu_vm_lock);
++		return ENXIO;
++	}
++	/* the dst rows the quad reads and writes */
++	uint64_t drow = q->dst_va + (uint64_t)q->y0 * q->dst_pitch, drows = (uint64_t)q->h * q->dst_pitch;
++	vm_cache((uint32_t)sf, q->src_va, slen);
++	vm_cache((uint32_t)df, drow, drows);
++	/* sample4.asm: 4 pixels per invocation from xa = x0 rounded down to 4 */
++	uint32_t xa = q->x0 & ~3u, groups = (q->x0 + q->w - xa + 3) / 4;
++	uint32_t consts[48] = {
++		q->m[0], q->m[1], q->m[2], q->m[3],
++		q->m[4], q->m[5], 0, 0x3f800000u,
++		0x437f0000u, 0x3f000000u, groups - 1, q->dst_pitch / 4,
++		xa, q->y0,
++		q->flags & (SWEET_GPU_QUAD_ADD | SWEET_GPU_QUAD_COPY) ? 0 : 0x3f800000u,        /* k0 */
++		q->flags & SWEET_GPU_QUAD_COPY ? 0xbf800000u : 0,                               /* k1 - 1 */
++		q->x0, q->x0 + q->w, 0xbf800000u, 0,
++		q->color[0], q->color[1], q->color[2], q->color[3],
++	};
++	for (uint32_t e = 0; e < 4; e++) {             /* c6-c9; unused edges pass everything */
++		consts[24 + 4 * e] = e < q->nedges ? q->edge[e][0] : 0;
++		consts[25 + 4 * e] = e < q->nedges ? q->edge[e][1] : 0;
++		consts[26 + 4 * e] = e < q->nedges ? q->edge[e][2] : 0x3f800000u;
++	}
++	consts[40] = 0x49800000u;                       /* K = 2^20 */
++	uint32_t tex[24], samp[8];
++	tex_desc(tex, q->src_va, q->src_w, q->src_h, q->src_pitch, fmt_code[q->src_fmt], swiz);
++	/* the whole pitch: groups at the right edge read (and keep) the padding */
++	tex_rgba8(tex + 12, q->dst_va, q->dst_pitch / 4, q->dst_h, q->dst_pitch);
++	samp_unnorm(samp, !(q->flags & SWEET_GPU_QUAD_NEAREST));
++	samp_unnorm(samp + 4, false);
++	struct cs_extra x = {consts, 12, tex, samp, 2, q->h};
++	uint64_t bufs[1] = {q->dst_va};
++	uint32_t sizes[1] = {(uint32_t)dlen};
++	uint64_t room_deadline;
++	clock_interval_to_deadline(500, NSEC_PER_MSEC, &room_deadline);
++	while (rb_free() < 512 && mach_absolute_time() < room_deadline) {
++		/* user submits queued ahead: compute_run emits ~200 dwords unchecked */
++	}
++	uint32_t seq = ++g_seq;
++	volatile uint32_t *fv = (volatile uint32_t *)(g_scratch_va + 64);
++	bool read = compute_run(g_gpu, &k_sample4, g_ksample4, bufs, sizes, (groups + 63) / 64, g_scratch + 64, seq, &x);
++	/*
++	 * Wait without the lock (user submits go on meanwhile): spin 0.5 ms
++	 * (delay() wakeups came ms late with the CPUs busy, 0140a), then poll
++	 * every 0.1 ms sleeping: a full-screen quad takes ~2 ms. The caller
++	 * keeps src and dst mapped.
++	 */
++	lck_mtx_unlock(&sweet_gpu_vm_lock);
++	bool done = false;
++	uint64_t deadline, spin_until;
++	clock_interval_to_deadline(500, NSEC_PER_MSEC, &deadline);
++	clock_interval_to_deadline(500, NSEC_PER_USEC, &spin_until);
++	while (read && !(done = (int32_t)(*fv - seq) >= 0) && mach_absolute_time() < deadline) {
++		if (mach_absolute_time() > spin_until) {
++			delay(100);
++		}
++		flush_dcache64((addr64_t)g_scratch + 64, 4, TRUE);
++	}
++	lck_mtx_lock(&sweet_gpu_vm_lock);
++	df = vm_range(q->dst_va, dlen);
++	if (df >= 0) {
++		vm_cache((uint32_t)df, drow, drows);
++	}
++	if (!done) {
++		g_ready = false;        /* hung: no recovery yet, fail fast from now on */
++		cp_state(g_gpu, "quad timeout:");
++		smmu_faults(g_smmu, "quad timeout:");
++		printf("SWEET GPU: quad timed out, GPU service off until reboot\n");
++	}
++	lck_mtx_unlock(&sweet_gpu_vm_lock);
++	return done ? 0 : ETIMEDOUT;
++}
++
++/*
++ * User command streams (sweet_gpu.h): IBs into the ring without waiting,
++ * fence page written by the CP. The ring is shared with sweet_gpu_quad
++ * (both under the VM lock); quads wait for the CP to read everything, user
++ * submits only for room (the CP reads past an IB once it has parsed it).
++ */
++static vm_offset_t g_fence_va;
++static uint64_t g_fence_pa;
++static uint32_t g_submit_seq;           /* last submitted */
++static uint32_t g_fence_seen;           /* fence value at g_fence_when */
++static uint64_t g_fence_when;
++static int g_max_mhz = 300;
++
++#define CP_INDIRECT_BUFFER_PFE  0x3f
++
++/* Ring dwords free (one slot stays empty: rptr == wptr means empty). */
++static uint32_t
++rb_free(void)
++{
++	return (gr(g_gpu, R_CP_RB_RPTR) - rb_n - 1) & (RB_DWORDS - 1);
++}
++
++static uint32_t
++fence_now(void)
++{
++	flush_dcache64((addr64_t)g_fence_pa, 64, TRUE);
++	return *(volatile uint32_t *)g_fence_va;
++}
++
++/* VM lock held: declare the GPU hung. */
++static void
++gpu_hung(const char *why)
++{
++	g_ready = false;
++	cp_state(g_gpu, why);
++	smmu_faults(g_smmu, why);
++	printf("SWEET GPU: %s: fence %u, submitted %u: GPU service off until reboot\n", why,
++	    fence_now(), g_submit_seq);
++}
++
++/* VM lock held: log (rate-limited) and clear a recorded SMMU fault, with the mapping below it. */
++static void
++smmu_report(void)
++{
++	static uint32_t logged;
++	vm_offset_t cb = g_smmu + 0x8000;
++	uint32_t fsr = rd(cb, 0x58);
++	if ((fsr & ~0x600u) == 0) {     /* bits 9-10: descriptor format only */
++		return;
++	}
++	uint64_t far = ((uint64_t)rd(cb, 0x64) << 32) | rd(cb, 0x60);
++	if (logged < 32) {
++		logged++;
++		int64_t below = -1;
++		if (far >= GVA_BASE && far - GVA_BASE < (uint64_t)GVA_PAGES * PAGE_SIZE && g_owner != NULL) {
++			for (int64_t p = (int64_t)((far - GVA_BASE) / PAGE_SIZE); p >= 0 && below < 0; p--) {
++				uint32_t m = g_owner[p];
++				if (m != 0 && m != VM_GUARD) {
++					below = m;
++				}
++			}
++		}
++		printf("SWEET GPU: SMMU fault (non-fatal) FSR %08x FAR %llx FSYNR0 %08x; mapping below: %llx + %llx\n",
++		    fsr, far, rd(cb, 0x68), below >= 0 ? g_maps[below].va : 0,
++		    below >= 0 ? (uint64_t)g_maps[below].npages * PAGE_SIZE : 0);
++	}
++	wr(cb, 0x58, fsr);      /* write-1-to-clear */
++}
++
++int
++sweet_gpu_submit(const struct sweet_gpu_ib *ib, uint32_t n, uint32_t *seqno)
++{
++	if (!g_ready || g_fence_va == 0) {
++		return ENXIO;
++	}
++	if (n == 0 || n > SWEET_GPU_MAX_IBS) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_gpu_vm_lock);
++	int ret = 0;
++	for (uint32_t i = 0; i < n && ret == 0; i++) {
++		if (ib[i].dwords == 0 || ib[i].dwords > 0xfffffu || (ib[i].iova & 3)) {
++			ret = EINVAL;
++		} else if (vm_range(ib[i].iova, (uint64_t)ib[i].dwords * 4) < 0) {
++			ret = EFAULT;
++		}
++	}
++	smmu_report();
++	uint32_t need = 4 * n + 6 + 5;
++	uint64_t deadline;
++	clock_interval_to_deadline(500, NSEC_PER_MSEC, &deadline);
++	while (ret == 0 && g_ready && rb_free() < need) {
++		if (mach_absolute_time() > deadline) {
++			gpu_hung("submit: ring full");
++			ret = ETIMEDOUT;
++		}
++	}
++	if (ret == 0 && !g_ready) {
++		ret = ENXIO;
++	}
++	if (ret == 0) {
++		for (uint32_t i = 0; i < n; i++) {
++			emit(pkt7(CP_INDIRECT_BUFFER_PFE, 3));
++			emit((uint32_t)ib[i].iova);
++			emit((uint32_t)(ib[i].iova >> 32));
++			emit(ib[i].dwords);
++		}
++		emit(pkt7(CP_SET_RENDER_MODE, 5)); emit(0); emit(0); emit(0); emit(0); emit(0);
++		uint32_t seq = ++g_submit_seq;
++		emit(pkt7(CP_EVENT_WRITE, 4)); emit(CACHE_FLUSH_TS);
++		emit((uint32_t)g_fence_pa); emit((uint32_t)(g_fence_pa >> 32)); emit(seq);
++		flush_dcache64((addr64_t)rb_pa, PAGE_SIZE, TRUE);
++		gw(g_gpu, R_CP_RB_WPTR, rb_n);
++		*seqno = seq;
++	}
++	lck_mtx_unlock(&sweet_gpu_vm_lock);
++	return ret;
++}
++
++int
++sweet_gpu_wait(uint32_t seqno, uint32_t timeout_ms)
++{
++	if (g_fence_va == 0) {
++		return ENXIO;
++	}
++	uint64_t deadline, spin_until;
++	clock_interval_to_deadline(timeout_ms, NSEC_PER_MSEC, &deadline);
++	clock_interval_to_deadline(2, NSEC_PER_MSEC, &spin_until);
++	for (;;) {
++		uint32_t f = fence_now();
++		if ((int32_t)(f - seqno) >= 0) {
++			return 0;
++		}
++		if (!g_ready) {
++			return ENXIO;
++		}
++		uint64_t now = mach_absolute_time();
++		lck_mtx_lock(&sweet_gpu_vm_lock);
++		if (f != g_fence_seen || g_fence_when == 0) {
++			g_fence_seen = f;
++			g_fence_when = now;
++		} else if (g_ready && f != g_submit_seq && usecs(now - g_fence_when) > 2000000) {
++			gpu_hung("wait: fence stuck 2 s");
++		}
++		lck_mtx_unlock(&sweet_gpu_vm_lock);
++		if (now > deadline) {
++			return ETIMEDOUT;
++		}
++		if (now > spin_until) {
++			delay(200);     /* past 2 ms, poll every ~0.2 ms without holding a CPU */
++		}
++	}
++}
++
++void
++sweet_gpu_set_fence_page(uintptr_t kva, uint64_t pa)
++{
++	g_fence_pa = pa;
++	g_fence_va = (vm_offset_t)kva;
++}
++
++void
++sweet_gpu_get_info(struct sweet_gpu_info *info)
++{
++	*info = (struct sweet_gpu_info){
++		.chip_id = 0x05030002u,         /* A530 v2 (MSM8996 Pro) */
++		.gmem_size = 0x100000u,
++		.gmem_base = 0x100000u,
++		.max_freq = (uint64_t)g_max_mhz * 1000000u,
++		.fence_pa = g_fence_pa,
++	};
++}
++
++/*
++ * sweetgpuclk=400: the 401.8 MHz corner; 600: GPLL0 undivided, inside the
++ * 624 MHz corner (MSM8996 Pro max; 600 is the closest GPLL0 rate, mmpll9
++ * stays untouched). GFX rail (PMI8994 S2) first to that corner's ceiling
++ * voltage (downstream msm8996 gfx_cpr qcom,cpr-voltage-ceiling: 825 mV at
++ * 401.8, 1015 mV at 624; open loop, no CPR), above 510 MHz VDD_MX to super
++ * turbo over the RPM, read back, then gfx3d = GPLL0 / 1.5 (field 2) or / 1
++ * (field 1). mem-acc is already in its high-voltage setting (0 at boot,
++ * corner-acc-map <1 0>). VM lock held: no quad runs meanwhile.
++ */
++extern bool sweet_rpm_mx_corner(uint32_t corner);
++
++static bool
++gfx_raise(int mhz)
++{
++#if defined(KUGO)
++	(void)mhz;
++	return false;   /* not yet: needs the CPR corner for >266 MHz */
++#endif
++	uint8_t sub = 0, v = 0;
++	uint32_t mv = mhz == 600 ? 1015 : 825;
++	if (!sweet_pmic_read(GFX_S2, 0x05, &sub) || (sub != 8 && sub != 9)) {
++		return false;
++	}
++	if (mhz == 600 && !sweet_rpm_mx_corner(7)) {
++		return false;
++	}
++	uint8_t vset = (uint8_t)((mv - (sub == 9 ? 80 : 0)) / 5);
++	if (!sweet_pmic_write(GFX_S2, 0x41, vset)) {
++		return false;
++	}
++	delay(4000);                    /* slew up to 270 mV, then settle */
++	if (!sweet_pmic_read(GFX_S2, 0x41, &v) || v != vset) {
++		printf("SWEET GPU: S2 vset %u, want %u: clock stays\n", v, vset);
++		return false;
++	}
++	return gfx_clock(mhz == 600 ? 1 : 2);
++}
++
++
++/* Full-screen (750x1334, pitch 3072) source-over quads: average us of 5. */
++static uint64_t
++quad_bench(void)
++{
++	static vm_offset_t va[2];
++	static uint64_t gva[2];
++	const uint32_t pitch = 3072, h = 1334, bytes = (pitch * h + PAGE_MASK) & ~PAGE_MASK;
++	for (int b = 0; b < 2 && gva[1] == 0; b++) {
++		uint64_t pa = gpu_alloc(&va[b], bytes), pages[(3072 * 1334 + PAGE_MASK) / PAGE_SIZE];
++		if (pa == 0) {
++			return 0;
++		}
++		for (uint32_t i = 0; i < bytes / PAGE_SIZE; i++) {
++			pages[i] = pa + (uint64_t)i * PAGE_SIZE;
++		}
++		gva[b] = sweet_gpu_vm_map(pages, bytes / PAGE_SIZE, false);
++		uint32_t *p = (uint32_t *)va[b];
++		for (uint32_t i = 0; i < pitch / 4 * h; i++) {
++			p[i] = b ? 0xff000000u | (i * 0x10305u) : src_px(i % 768, i / 768);
++		}
++	}
++	if (gva[0] == 0 || gva[1] == 0) {
++		return 0;
++	}
++	struct sweet_gpu_quad q = {
++		.src_va = gva[0], .dst_va = gva[1],
++		.src_w = 750, .src_h = h, .src_pitch = pitch,
++		.dst_w = 750, .dst_h = h, .dst_pitch = pitch,
++		.w = 750, .h = h,
++		.m = {0x3f800000u, 0, 0, 0x3f800000u, 0, 0},
++		.color = {0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3f800000u}, .src_swiz = SWIZ_XYZW,
++	};
++	uint64_t t0 = mach_absolute_time();
++	for (int i = 0; i < 5; i++) {
++		if (sweet_gpu_quad(&q) != 0) {
++			return 0;
++		}
++	}
++	return usecs(mach_absolute_time() - t0) / 5;
++}
++
++/* sweet_gpu_quad once, on scattered kernel buffers (sample_test A through the API). */
++static void
++api_selftest(void)
++{
++	vm_offset_t sva, dva;
++	uint64_t src = vm_buffer(&sva, 64 * 64 * 4), dst = vm_buffer(&dva, 128 * 128 * 4);
++	if (src == 0 || dst == 0) {
++		printf("SWEET GPU: api selftest: no buffers\n");
++		return;
++	}
++	uint32_t *s = (uint32_t *)sva, *d = (uint32_t *)dva;
++	for (uint32_t i = 0; i < 64 * 64; i++) {
++		s[i] = src_px(i % 64, i / 64);
++	}
++	struct sweet_gpu_quad q = {
++		.src_va = src, .dst_va = dst,
++		.src_w = 64, .src_h = 64, .src_pitch = 256,
++		.dst_w = 128, .dst_h = 128, .dst_pitch = 512,
++		.y0 = 16, .h = 64,
++		.m = {0x3f800000u, 0, 0, 0x3f800000u, 0, 0xc1800000u},
++		.color = {0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3f800000u}, .src_swiz = SWIZ_XYZW,
++	};
++	/* source-over at x0 16 (4-aligned), source-over and copy at x0 13, w 61 */
++	static const struct { uint32_t x0, w, tx, flags; } t[3] = {
++		{16, 64, 0xc1800000u, 0}, {13, 61, 0xc1500000u, 0}, {13, 61, 0xc1500000u, SWEET_GPU_QUAD_COPY},
++	};
++	int r = 0;
++	uint32_t bad = 0;
++	uint64_t t0 = 0, t1 = 0;
++	for (int k = 0; k < 3; k++) {
++		for (uint32_t i = 0; i < 128 * 128; i++) {
++			d[i] = 0xff000000u | ((i * 7) & 0xff) << 16 | ((i * 13) & 0xff) << 8 | (i & 0xff);
++		}
++		q.x0 = t[k].x0, q.w = t[k].w, q.m[4] = t[k].tx, q.flags = t[k].flags;
++		uint64_t a0 = mach_absolute_time();
++		int rk = sweet_gpu_quad(&q);
++		if (k == 0) {
++			t0 = a0, t1 = mach_absolute_time();
++		}
++		r = r ? r : rk;
++		for (uint32_t i = 0; i < 128 * 128; i++) {
++			uint32_t px = i % 128, py = i / 128;
++			uint32_t dd = 0xff000000u | ((i * 7) & 0xff) << 16 | ((i * 13) & 0xff) << 8 | (i & 0xff);
++			bool in = px >= t[k].x0 && px < t[k].x0 + t[k].w && py >= 16 && py < 80;
++			uint32_t sp = in ? src_px(px - t[k].x0, py - 16) : 0;
++			uint32_t want = !in ? dd : t[k].flags ? sp : blend_ref(sp, dd);
++			for (int c = 0; c < 32; c += 8) {
++				int df = (int)((d[i] >> c) & 0xff) - (int)((want >> c) & 0xff);
++				if (df > 1 || df < -1) {
++					bad++;
++					break;
++				}
++			}
++		}
++	}
++	/* rejected: rect past the dst edge, unmapped src */
++	struct sweet_gpu_quad e1 = q, e2 = q;
++	e1.x0 = 100;
++	e2.src_va = 0x3ff000000ull;
++	int r1 = sweet_gpu_quad(&e1), r2 = sweet_gpu_quad(&e2);
++	printf("SWEET GPU: api selftest: sweet_gpu_quad -> %d in %llu us, %u bad pixels; bad rect -> %d, unmapped -> %d -> %s\n",
++	    r, usecs(t1 - t0), bad, r1, r2, r == 0 && bad == 0 && r1 == EINVAL && r2 == EFAULT ? "API OK" : "API WRONG");
++}
++
++/* Step 4.1: fill.asm and blend.asm, checked by the CPU. */
++static void
++compute_test(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t scratch_va, uint64_t scratch)
++{
++	const uint32_t groups = 16, n = 64 * groups, bytes = n * 4;
++	vm_offset_t ava, bva, wva;
++	uint64_t a = gpu_page(&ava), b = gpu_page(&bva), w = gpu_page(&wva);
++	uint64_t kfill = kernel_page(&k_fill), kblend = kernel_page(&k_blend);
++	if (a == 0 || b == 0 || w == 0 || kfill == 0 || kblend == 0 || bytes > PAGE_SIZE) {
++		printf("SWEET GPU: no compute pages\n");
++		return;
++	}
++	uint32_t *pa_ = (uint32_t *)ava, *pb = (uint32_t *)bva, *want = (uint32_t *)wva;
++	volatile uint32_t *fv = (volatile uint32_t *)(scratch_va + 32);
++
++	for (uint32_t t = 0; t < 2; t++) {
++		if (t == 0) {
++			memset(pa_, 0xee, bytes);
++		} else {
++			for (uint32_t i = 0; i < n; i++) {
++				/* premultiplied source: every channel <= alpha */
++				uint32_t al = (i * 37) & 0xff, c = al ? (i * 11) % (al + 1) : 0;
++				pa_[i] = (al << 24) | (c << 16) | ((c / 2) << 8) | (c / 3);
++				pb[i] = 0xff000000u | ((i * 7) & 0xff) << 16 | ((i * 13) & 0xff) << 8 | (i & 0xff);
++				want[i] = blend_ref(pa_[i], pb[i]);
++			}
++		}
++		flush_dcache64((addr64_t)a, PAGE_SIZE, TRUE);
++		flush_dcache64((addr64_t)b, PAGE_SIZE, TRUE);
++		wr(smmu + 0x8000, 0x58, 0xffffffffu);
++		uint64_t bufs[2] = {a, b};
++		uint32_t sizes[2] = {bytes, bytes};
++		bool read = compute_run(gpu, t == 0 ? &k_fill : &k_blend, t == 0 ? kfill : kblend,
++		    bufs, sizes, groups, scratch + 32, 0x400 + t, NULL);
++		delay(5000);
++		flush_dcache64((addr64_t)scratch, 64, TRUE);
++		flush_dcache64((addr64_t)a, PAGE_SIZE, TRUE);
++		flush_dcache64((addr64_t)b, PAGE_SIZE, TRUE);
++		const uint32_t *o = t == 0 ? pa_ : pb;
++		uint32_t bad = 0, first = ~0u;
++		for (uint32_t i = 0; i < n; i++) {
++			uint32_t w = t == 0 ? (i ^ 0x5a5a0000u) : want[i];
++			if (o[i] != w && bad++ == 0) {
++				first = i;
++			}
++		}
++		cp_state(gpu, read ? "compute read:" : "compute NOT read (200 ms):");
++		smmu_faults(smmu, "after compute:");
++		printf("SWEET GPU: compute %s, %u pixels: fence %x (want %x), %u wrong (first [%u] = %08x want %08x); "
++		    "out[1..3] %08x %08x %08x -> %s\n", t == 0 ? "fill" : "blend (premultiplied source-over)", n,
++		    *fv, 0x400 + t, bad, first, first < n ? o[first] : 0,
++		    first < n ? (t == 0 ? first ^ 0x5a5a0000u : want[first]) : 0, o[1], o[2], o[3],
++		    bad == 0 ? (t == 0 ? "GPU SHADER WORKS" : "GPU BLEND MATCHES THE CPU") : "wrong");
++		if (!read) {
++			return;
++		}
++		gpu_wait(1);
++	}
++}
++
++/* Step 2: command processor. */
++static void
++cp_test(vm_offset_t gpu, int level)
++{
++	uint64_t pm4, pfp;
++	uint32_t pm4_len, pfp_len;
++	if (!blob("GPU-PM4", &pm4, &pm4_len) || !blob("GPU-PFP", &pfp, &pfp_len)) {
++		printf("SWEET GPU: no GPU-PM4/GPU-PFP in the payload, no CP test\n");
++		return;
++	}
++	vm_offset_t smmu = ml_io_map(SMMU_PA, 0x10000);
++	if (smmu == 0) {
++		return;
++	}
++	g_smmu = smmu;
++	printf("SWEET GPU: SMMU sCR0 %08x IDR0 %08x IDR1 %08x SMR0 %08x S2CR0 %08x CB0 SCTLR %08x\n",
++	    rd(smmu, 0), rd(smmu, 0x20), rd(smmu, 0x24), rd(smmu, 0x800), rd(smmu, 0xc00), rd(smmu, 0x8000));
++	if (!smmu_identity(smmu)) {
++		printf("SWEET GPU: no GPU memory access without the SMMU set up, stop\n");
++		return;
++	}
++	vm_offset_t ring_va, scratch_va;
++	uint64_t scratch = gpu_page(&scratch_va);
++	rb_pa = gpu_page(&ring_va);
++	if (rb_pa == 0 || scratch == 0) {
++		printf("SWEET GPU: no ring/scratch page\n");
++		return;
++	}
++	rb = (uint32_t *)ring_va;
++	printf("SWEET GPU: pm4 %llx (%u) pfp %llx (%u) ring %llx scratch %llx\n",
++	    pm4, pm4_len, pfp, pfp_len, rb_pa, scratch);
++	flush_dcache64((addr64_t)pm4, pm4_len, TRUE);
++	flush_dcache64((addr64_t)pfp, pfp_len, TRUE);
++	gpu_wait(11);
++
++	/*
++	 * a5xx_pm_resume (A530): power the RB/CCU and SP islands; without them
++	 * the CP hung on the first 2D blit (0126a, RBBM_STATUS c00001c3).
++	 */
++#if defined(KUGO)
++	g_gpu_regs = gpu;
++	/* A510: no GPMU islands (mainline a5xx_pm_resume returns early) */
++	bool rbccu = true, sp = true;
++	if (0) {
++#else
++	bool rbccu, sp;
++	{
++#endif
++	gw(gpu, R_GPMU_RBCCU_POWER_CNTL, 0x778000);
++	rbccu = poll(gpu, R_GPMU_RBCCU_PWR_CLK_STATUS * 4, 1u << 20, 1u << 20, 1);
++	gw(gpu, R_GPMU_SP_POWER_CNTL, 0x778000);
++	sp = poll(gpu, R_GPMU_SP_PWR_CLK_STATUS * 4, 1u << 20, 1u << 20, 1);
++	}
++	printf("SWEET GPU: RBCCU power %s (%08x), SP power %s (%08x)\n", rbccu ? "on" : "TIMEOUT",
++	    gr(gpu, R_GPMU_RBCCU_PWR_CLK_STATUS), sp ? "on" : "TIMEOUT", gr(gpu, R_GPMU_SP_PWR_CLK_STATUS));
++
++	/* Subset of a5xx_hw_init (A530 values; HWCG, GPMU firmware, CP_PROTECT left out). */
++	gw(gpu, R_VBIF_RR_QOS_ARB, 3);
++	gw(gpu, R_RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
++	gw(gpu, R_RBBM_AHB_CNTL0, 1);
++	gw(gpu, R_UCHE_CACHE_WAYS, 2);
++	gw64(gpu, R_UCHE_TRAP_BASE, 0x0001ffffffff0000ull);
++	gw64(gpu, R_UCHE_WRITE_THRU_BASE, 0x0001ffffffff0000ull);
++	gw64(gpu, R_UCHE_GMEM_RANGE_MIN, 0x00100000);
++#if defined(KUGO)
++	gw64(gpu, R_UCHE_GMEM_RANGE_MAX, 0x00100000 + 0x40000 - 1);    /* A510: 256 KB GMEM */
++	gw(gpu, R_CP_MEQ_THRESHOLDS, 0x20);
++	gw(gpu, R_CP_MERCIU_SIZE, 0x20);
++	gw(gpu, R_CP_ROQ_THRESHOLDS_2, 0x40000030);
++	gw(gpu, R_CP_ROQ_THRESHOLDS_1, 0x20100d0a);
++	gw(gpu, R_PC_DBG_ECO_CNTL, (0x200u << 11) | (0x200u << 22));
++	gw(gpu, R_RB_DBG_ECO_CNTL, gr(gpu, R_RB_DBG_ECO_CNTL) & ~(1u << 11));   /* CCU fix on newer A510s */
++#else
++	gw64(gpu, R_UCHE_GMEM_RANGE_MAX, 0x00100000 + 0x100000 - 1);   /* 1 MB GMEM */
++	gw(gpu, R_CP_MEQ_THRESHOLDS, 0x40);
++	gw(gpu, R_CP_MERCIU_SIZE, 0x40);
++	gw(gpu, R_CP_ROQ_THRESHOLDS_2, 0x80000060);
++	gw(gpu, R_CP_ROQ_THRESHOLDS_1, 0x40201b16);
++	gw(gpu, R_PC_DBG_ECO_CNTL, (0x400u << 11) | (0x300u << 22));
++#endif
++	gw(gpu, R_UCHE_MODE_CNTL, 1u << 29);
++	gw(gpu, R_CP_CHICKEN_DBG, 0x02000000);
++	gw(gpu, R_RBBM_AHB_CNTL1, 0xa6ffffff);
++	gw(gpu, R_RBBM_AHB_CNTL2, 0x3f);
++#if defined(KUGO)
++	gw(gpu, R_TPL1_MODE_CNTL, 1u << 7);     /* highest bank bit 14 (live DT) */
++	gw(gpu, R_RB_MODE_CNTL, 1u << 1);
++#else
++	gw(gpu, R_TPL1_MODE_CNTL, 2u << 7);     /* highest bank bit 15 */
++	gw(gpu, R_RB_MODE_CNTL, 2u << 1);
++#endif
++	gw(gpu, R_VPC_DBG_ECO_CNTL, gr(gpu, R_VPC_DBG_ECO_CNTL) | (1u << 10));
++	gw(gpu, R_SECVID_TSB_CNTL, 0);
++	gw64(gpu, R_SECVID_TSB_BASE, 0);
++	gw(gpu, R_SECVID_TSB_SIZE, 0);
++	/*
++	 * Every block in 64-bit mode (the CP alone was not enough: the 0127a
++	 * blit faulted at the source PA's low 32 bits).
++	 */
++	static const uint16_t addr_mode[] = {
++		0x0860 /* CP */, 0x0bc1 /* VSC */, 0x0c81 /* GRAS */, 0x0cc5 /* RB */, 0x0d01 /* PC */,
++		0x0e05 /* HLSQ */, 0x0e41 /* VFD */, 0x0e61 /* VPC */, 0x0e80 /* UCHE */, 0x0ec1 /* SP */,
++		0x0f01 /* TPL1 */, R_SECVID_TSB_ADDR_MODE,
++	};
++	for (unsigned i = 0; i < sizeof(addr_mode) / sizeof(addr_mode[0]); i++) {
++		gw(gpu, addr_mode[i], 1);
++	}
++	gw64(gpu, R_CP_ME_INSTR_BASE, pm4);
++	gw64(gpu, R_CP_PFP_INSTR_BASE, pfp);
++	gw64(gpu, R_CP_RB_BASE, rb_pa);
++	/* BUFSZ log2(16 KB / 8) = 11, BLKSZ log2(32 / 8) = 2 (mainline), NO_UPDATE */
++	gw(gpu, R_CP_RB_CNTL, 11u | (2u << 8) | (1u << 27));
++	cp_state(gpu, "before ME start:");
++
++	rb_n = 0;
++	emit(pkt7(CP_ME_INIT, 8));
++	emit(0x2f);
++	emit(0x3);
++	emit(0x20000000);
++	emit(0);
++	emit(0);
++#if defined(KUGO)
++	emit(0x1);              /* A510 token and syncs workaround (mainline a5xx_me_init) */
++#else
++	emit(0xb);              /* A530 token-end-sync workaround */
++#endif
++	emit(0);
++	emit(0);
++	emit(pkt7(CP_MEM_WRITE, 3));
++	emit((uint32_t)scratch);
++	emit((uint32_t)(scratch >> 32));
++	emit(0xc0ffee01);
++	emit(pkt7(CP_NOP, 0));
++	flush_dcache64((addr64_t)scratch, PAGE_SIZE, TRUE);
++
++	gw(gpu, R_CP_PFP_ME_CNTL, 0);   /* clear ME_HALT */
++	bool read = kick(gpu);
++	delay(1000);
++	flush_dcache64((addr64_t)scratch, 64, TRUE);
++	uint32_t got = *(volatile uint32_t *)scratch_va;
++	cp_state(gpu, read ? "ring consumed:" : "ring NOT consumed (200 ms):");
++	smmu_faults(smmu, "after ring:");
++	printf("SWEET GPU: scratch %08x -> %s\n", got,
++	    got == 0xc0ffee01 ? "CP_MEM_WRITE landed: COMMAND PROCESSOR WORKS" : "no write");
++	if (level >= 3 && read && got == 0xc0ffee01) {
++		/* Leave secure mode (see the header). */
++		gpu_wait(11);
++		if (!zap_load()) {
++			printf("SWEET GPU: no zap shader, the GPU stays secure: no blit test\n");
++			return;
++		}
++		gpu_wait(2);
++#if !defined(KUGO)
++		emit(pkt7(CP_SET_SECURE_MODE, 1));
++		emit(0);
++#endif
++		emit(pkt7(CP_MEM_WRITE, 3));
++		emit((uint32_t)scratch + 8);
++		emit((uint32_t)(scratch >> 32));
++		emit(0x5ec0de00);
++		read = kick(gpu);
++		delay(1000);
++		flush_dcache64((addr64_t)scratch, 64, TRUE);
++		cp_state(gpu, read ? "after CP_SET_SECURE_MODE 0:" : "CP_SET_SECURE_MODE 0 NOT read:");
++		smmu_faults(smmu, "after CP_SET_SECURE_MODE 0:");
++		printf("SWEET GPU: marker after secure-mode packet %08x (want 5ec0de00)\n",
++		    *(volatile uint32_t *)(scratch_va + 8));
++		gpu_wait(2);
++		if (level >= 8) {
++			(void)gfx_clock(3);     /* 300 MHz */
++			g_ksample4 = kernel_page(&k_sample4);
++			if (g_ksample4 == 0 || !vm_init(smmu)) {
++				printf("SWEET GPU: service bring-up FAILED\n");
++				return;
++			}
++			g_gpu = gpu;
++			g_scratch = scratch;
++			g_scratch_va = scratch_va;
++			g_ready = true;
++			printf("SWEET GPU: service ready (300 MHz, GPU VA window 8-16 GB)\n");
++			api_selftest();
++			int mhz = 300;
++			(void)PE_parse_boot_argn("sweetgpuclk", &mhz, sizeof(mhz));
++			g_max_mhz = 300;
++			uint64_t us300 = quad_bench();
++			if (mhz == 400 || mhz == 600) {
++				lck_mtx_lock(&sweet_gpu_vm_lock);
++				bool ok = gfx_raise(mhz);
++				lck_mtx_unlock(&sweet_gpu_vm_lock);
++				g_max_mhz = ok ? mhz : 300;
++				uint64_t usx = ok ? quad_bench() : 0;
++				printf("SWEET GPU: full-screen quad %llu us at 300 MHz, %llu us at %d MHz (%s)\n",
++				    us300, usx, mhz, !ok ? "switch FAILED" : mhz == 600 ? "S2 1015 mV, MX turbo, GPLL0/1" :
++				    "S2 825 mV, GPLL0/1.5");
++				if (ok) {
++					api_selftest();
++				}
++			} else {
++				printf("SWEET GPU: full-screen quad %llu us at 300 MHz\n", us300);
++			}
++			return;
++		}
++		if (level >= 7) {
++			(void)gfx_clock(3);     /* 300 MHz */
++			bool vm = vm_init(smmu);
++			printf("SWEET GPU: GPU VA window 8-16 GB %s\n", vm ? "ready" : "FAILED");
++			if (vm) {
++				sample_test(gpu, smmu, scratch_va, scratch, true);
++			}
++			return;
++		}
++		blit_test(gpu, smmu, scratch_va, scratch);
++		if (level >= 4) {
++			gpu_wait(2);
++			compute_test(gpu, smmu, scratch_va, scratch);
++		}
++		if (level >= 6) {
++			gpu_wait(2);
++			(void)gfx_clock(3);     /* 300 MHz */
++			sample_test(gpu, smmu, scratch_va, scratch, false);
++		} else if (level >= 5) {
++			gpu_wait(2);
++			bench_test(gpu, smmu, scratch_va, scratch);
++		}
++	}
++}
++
++#if defined(KUGO)
++static vm_offset_t spmi_core, spmi_obs_base, spmi_chnls_base;
++
++static uint32_t
++kugo_spmi_apid(uint16_t ppid)
++{
++	for (uint32_t apid = 0; apid < 256; apid++) {
++		uint32_t map = rd(spmi_core, 0x800u + 4u * apid);
++		if (map && ((map >> 8) & 0xfffu) == ppid) {
++			return apid;
++		}
++	}
++	return 0xffff;
++}
++
++/* PMIC arbiter v2, one byte: observer channel to read, this EE's channel to write (EXT_WRITEL). */
++static bool
++kugo_pmic_xfer(uint16_t ppid, uint8_t addr, uint8_t *val, bool write)
++{
++	if (spmi_core == 0) {
++		spmi_core = ml_io_map(SPMI_CORE_PA, 0x1000);
++		if (spmi_core == 0) {
++			return false;
++		}
++	}
++	uint32_t apid = kugo_spmi_apid(ppid);
++	if (apid == 0xffff) {
++		return false;
++	}
++	vm_offset_t ch = ml_io_map((write ? SPMI_CHNLS_PA : SPMI_OBS_PA) + 0x8000u * apid, 0x1000);
++	if (ch == 0) {
++		return false;
++	}
++	if (write) {
++		wr(ch, 0x10, *val);
++	}
++	wr(ch, 0x00, ((write ? 0u : 1u) << 27) | ((uint32_t)addr << 4));
++	for (int i = 0; i < 1000; i++) {
++		uint32_t st = rd(ch, 0x08);
++		if (st & 0x0eu) {
++			return false;
++		}
++		if (st & 1u) {
++			if (!write) {
++				*val = (uint8_t)rd(ch, 0x18);
++			}
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++kugo_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out)
++{
++	return kugo_pmic_xfer(ppid, addr, out, false);
++}
++
++static bool
++kugo_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val)
++{
++	return kugo_pmic_xfer(ppid, addr, &val, true);
++}
++
++static void
++kugo_dump(vm_offset_t g, const char *when)
++{
++	printf("SWEET GPU: %s cx %08x gx %08x clamp %08x rcg %08x/%08x gfx3d %08x gmem %08x ahb %08x "
++	    "timer %08x aon %08x bimc_gfx %08x\n", when, rd(g, G_CX_GDSC), rd(g, G_GX_GDSC), rd(g, G_GX_CLAMP),
++	    rd(g, G_GFX3D_CMD), rd(g, G_GFX3D_CFG), rd(g, G_GFX3D_BR), rd(g, G_GMEM_BR), rd(g, G_AHB_BR),
++	    rd(g, G_TIMER_BR), rd(g, G_AON_BR), rd(g, G_BIMC_GFX_BR));
++}
++
++/* the shim probe's sequence (shim/gpu.c), with the rail code of the Pixel path */
++static void
++gpu_thread(void *arg, wait_result_t result)
++{
++	(void)result;
++	g_level = (int)(uintptr_t)arg;
++	gpu_sleep(g_level >= 8 ? 2 : 20);
++	vm_offset_t g = ml_io_map(GCC_PA, 0x80000);
++	if (g == 0) {
++		printf("SWEET GPU: map failed\n");
++		return;
++	}
++	mmcc = g;
++	uint8_t s5[7] = {0};
++	static const uint8_t s5regs[7] = {0x04, 0x05, 0x08, 0x40, 0x41, 0x45, 0x46};
++	bool s5ok = true;
++	for (int i = 0; i < 7; i++) {
++		s5ok = s5ok && sweet_pmic_read(GFX_S2, s5regs[i], &s5[i]);
++	}
++	printf("SWEET GPU: A510, PM8004 S5 %s type %02x subtype %02x status %02x range %02x vset %02x mode %02x en %02x\n",
++	    s5ok ? "ok" : "UNREADABLE", s5[0], s5[1], s5[2], s5[3], s5[4], s5[5], s5[6]);
++	kugo_dump(g, "at boot:");
++	if (!s5ok || s5[3] != 0) {
++		printf("SWEET GPU: S5 unreadable or not range 0, stop\n");
++		return;
++	}
++	uint8_t vset = (uint8_t)((KUGO_GFX_MV - 80) / 5), en = 0, v = 0, st = 0;
++	bool ok = sweet_pmic_write(GFX_S2, 0x41, vset) && sweet_pmic_write(GFX_S2, 0x46, 0x80);
++	delay(2000);
++	(void)(sweet_pmic_read(GFX_S2, 0x46, &en) && sweet_pmic_read(GFX_S2, 0x41, &v) &&
++	    sweet_pmic_read(GFX_S2, 0x08, &st));
++	printf("SWEET GPU: S5 %u mV %s: en %02x vset %02x status %02x\n", KUGO_GFX_MV,
++	    ok && (en & 0x80) ? "on" : "FAILED", en, v, st);
++	if (!ok || !(en & 0x80)) {
++		return;
++	}
++
++	bool ahb = branch_on(g, G_AHB_BR), bimc = branch_on(g, G_BIMC_GFX_BR);
++	(void)branch_on(g, G_AON_BR);
++	(void)branch_on(g, G_TIMER_BR);
++	wr(g, G_CX_GDSC, rd(g, G_CX_GDSC) & ~1u);
++	bool cx = poll(g, G_CX_GDSC, 1u << 31, 1u << 31, 100);
++	(void)gfx_clock(7);                     /* GPLL0 / 4 = 200 MHz */
++	wr(g, G_GX_GDSC, rd(g, G_GX_GDSC) & ~1u);
++	(void)poll(g, G_GX_GDSC, 1u << 31, 1u << 31, 100);
++	wr(g, G_GX_CLAMP, rd(g, G_GX_CLAMP) & ~1u);
++	bool b1 = branch_on(g, G_GFX3D_BR), b2 = branch_on(g, G_GMEM_BR);
++	kugo_dump(g, "after power-up:");
++	printf("SWEET GPU: cx %s ahb %s bimc_gfx %s gfx3d %s gmem %s\n", cx ? "on" : "TIMEOUT",
++	    ahb ? "on" : "OFF", bimc ? "on" : "OFF", b1 ? "on" : "OFF", b2 ? "on" : "OFF");
++	if (!(cx && ahb && b1)) {
++		printf("SWEET GPU: not all on, no GPU register access\n");
++		return;
++	}
++	vm_offset_t gpu = ml_io_map(GPU_PA, 0x40000);
++	if (gpu == 0) {
++		printf("SWEET GPU: GPU map failed\n");
++		return;
++	}
++	uint32_t vbif = rd(gpu, 0x3000 * 4), status = rd(gpu, 0x4f5 * 4), aon0 = rd(gpu, 0x4d2 * 4);
++	delay(1000);
++	uint32_t aon1 = rd(gpu, 0x4d2 * 4);
++	printf("SWEET GPU: VBIF_VERSION %08x RBBM_STATUS %08x ALWAYSON %08x -> %08x (%s)\n",
++	    vbif, status, aon0, aon1, aon1 != aon0 ? "counting: GPU alive" : "not counting");
++	if (g_level >= 2 && aon1 != aon0) {
++		gpu_wait(2);
++		cp_test(gpu, g_level);
++	}
++}
++#else
++
++static void
++gpu_thread(void *arg, wait_result_t result)
++{
++	(void)result;
++	g_level = (int)(uintptr_t)arg;
++	if (g_level >= 8) {
++		/* as soon as the PMIC answers (sweet_keys maps SPMI during boot) */
++		uint8_t t;
++		for (int i = 0; i < 60 && !sweet_pmic_read(GFX_S2, 0x04, &t); i++) {
++			gpu_sleep(1);
++		}
++	} else {
++		gpu_sleep(40);
++	}
++	vm_offset_t mm = ml_io_map(MMCC_PA, 0x10000);
++	vm_offset_t gcc = ml_io_map(GCC_PA + 0x9000, 0x1000);
++	vm_offset_t gcc46 = ml_io_map(GCC_PA + 0x46000, 0x1000);
++	vm_offset_t memacc = ml_io_map(MEMACC_PA, 0x1000);
++	mmcc = mm;
++	if (mm == 0 || gcc == 0 || gcc46 == 0 || memacc == 0) {
++		printf("SWEET GPU: map failed\n");
++		return;
++	}
++
++	/* 1. Read-only state. */
++	uint8_t s2[7] = {0};
++	static const uint8_t s2regs[7] = {0x04, 0x05, 0x08, 0x40, 0x41, 0x45, 0x46};
++	bool s2ok = false;
++	/* the first answers can be partial (0160d: type 00): read again a few times */
++	for (int attempt = 0; attempt < 10 && !(s2ok && s2[0] == 0x1c); attempt++) {
++		if (attempt > 0) {
++			gpu_sleep(1);
++		}
++		s2ok = true;
++		for (int i = 0; i < 7; i++) {
++			s2ok = s2ok && sweet_pmic_read(GFX_S2, s2regs[i], &s2[i]);
++		}
++	}
++	printf("SWEET GPU: S2 %s type %02x subtype %02x status %02x range %02x vset %02x (%u) mode %02x en %02x; mem-acc %08x\n",
++	    s2ok ? "ok" : "UNREADABLE", s2[0], s2[1], s2[2], s2[3], s2[4], s2[4], s2[5], s2[6],
++	    rd(memacc, 4));
++	dump(mm, gcc, gcc46, "at boot:");
++	gpu_wait(11);
++
++	/* 2. GFX rail. Range 0 only: FTS2 (subtype 8) 5 mV steps from 0, FTS2.5 (9) from 80 mV. */
++	if (!s2ok || s2[0] != 0x1c || s2[3] != 0 || (s2[1] != 8 && s2[1] != 9)) {
++		printf("SWEET GPU: S2 not a range-0 FTS2/2.5 regulator, stop\n");
++		return;
++	}
++	if (!(s2[6] & 0x80)) {
++		uint8_t vset = (uint8_t)((745 - (s2[1] == 9 ? 80 : 0)) / 5);
++		bool ok = false;
++		uint8_t en = 0, v = 0, st = 0;
++		/* the enable did not stick once (0154b: en 00, GPU never came up): retry */
++		for (int attempt = 0; attempt < 5 && !(ok && (en & 0x80)); attempt++) {
++			ok = sweet_pmic_write(GFX_S2, 0x41, vset) && sweet_pmic_write(GFX_S2, 0x46, 0x80);
++			delay(1000 + attempt * 10000);
++			(void)(sweet_pmic_read(GFX_S2, 0x46, &en) && sweet_pmic_read(GFX_S2, 0x41, &v) &&
++			    sweet_pmic_read(GFX_S2, 0x08, &st));
++			printf("SWEET GPU: S2 enable %s (try %d): en %02x vset %u status %02x\n",
++			    ok && (en & 0x80) ? "ok" : "FAILED", attempt + 1, en, v, st);
++		}
++		if (!ok || !(en & 0x80)) {
++			return;
++		}
++	} else {
++		printf("SWEET GPU: S2 already on (vset %u), left as is\n", s2[4]);
++	}
++	gpu_wait(11);
++
++	/* 3. CX side: GPU GDSC + AHB clock. */
++	bool cx = gdsc_on(mm, 0x4034);
++	bool ahb = branch_on(mm, 0x403c);
++	printf("SWEET GPU: gpu_gdsc %s %08x, ahb %s %08x\n", cx ? "on" : "TIMEOUT", rd(mm, 0x4034),
++	    ahb ? "on" : "TIMEOUT", rd(mm, 0x403c));
++	gpu_wait(11);
++
++	/* 4. GX: release IO clamp, GDSC on, retain mem/periph on the core branch. */
++	wr(mm, 0x4300, rd(mm, 0x4300) & ~1u);
++	bool gx = gdsc_on(mm, 0x4024);
++	wr(mm, 0x4028, rd(mm, 0x4028) | (1u << 14) | (1u << 13));
++	printf("SWEET GPU: gx_gdsc %s %08x clamp %08x\n", gx ? "on" : "TIMEOUT", rd(mm, 0x4024), rd(mm, 0x4300));
++	gpu_wait(11);
++
++	/* 5. Clocks: gfx3d = GPLL0 (src 5) / 3 (div field 2*3-1), rbbmtimer = XO. */
++	wr(mm, 0x4004, (5u << 8) | 5u);
++	wr(mm, 0x4000, rd(mm, 0x4000) | 1u);
++	bool r1 = poll(mm, 0x4000, 1u, 0, 10);
++	wr(mm, 0x4094, (0u << 8) | 0u);
++	wr(mm, 0x4090, rd(mm, 0x4090) | 1u);
++	bool r2 = poll(mm, 0x4090, 1u, 0, 10);
++	bool b1 = branch_on(mm, 0x4028), b2 = branch_on(mm, 0x40b0);
++	bool g1 = branch_on(gcc, 0x10), g2 = branch_on(gcc46, 0x18);
++	printf("SWEET GPU: rcg gfx3d %s rbbm %s; branches gfx3d %s rbbm %s mmss_bimc_gfx %s bimc_gfx %s\n",
++	    r1 ? "ok" : "TIMEOUT", r2 ? "ok" : "TIMEOUT", b1 ? "on" : "OFF", b2 ? "on" : "OFF",
++	    g1 ? "on" : "OFF", g2 ? "on" : "OFF");
++	dump(mm, gcc, gcc46, "after power-up:");
++	if (!(cx && ahb && gx && b1 && b2 && g1 && g2)) {
++		printf("SWEET GPU: not all on, no GPU register access\n");
++		return;
++	}
++	gpu_wait(11);
++
++	/* 6. GPU registers. */
++	vm_offset_t gpu = ml_io_map(GPU_PA, 0x40000);
++	if (gpu == 0) {
++		printf("SWEET GPU: GPU map failed\n");
++		return;
++	}
++	printf("SWEET GPU: reading GPU registers\n");
++	uint32_t vbif = rd(gpu, 0x3000 * 4);
++	uint32_t status = rd(gpu, 0x4f5 * 4);
++	uint32_t aon0 = rd(gpu, 0x4d2 * 4);
++	delay(1000);
++	uint32_t aon1 = rd(gpu, 0x4d2 * 4);
++	printf("SWEET GPU: VBIF_VERSION %08x RBBM_STATUS %08x ALWAYSON %08x -> %08x (%s)\n",
++	    vbif, status, aon0, aon1, aon1 != aon0 ? "counting: GPU alive" : "not counting");
++	if ((int)(uintptr_t)arg >= 2 && aon1 != aon0) {
++		gpu_wait(11);
++		cp_test(gpu, (int)(uintptr_t)arg);
++	}
++}
++#endif /* !KUGO: the Pixel's gpu_thread */
++
++void
++sweet_gpu_init(void)
++{
++	int on = 0;
++	thread_t thread;
++	if (!PE_parse_boot_argn("sweetgpu", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	if (kernel_thread_start(gpu_thread, (void *)(uintptr_t)on, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET || KUGO */
+diff --git a/bsd/dev/sweet_gpu.h b/bsd/dev/sweet_gpu.h
+new file mode 100644
+index 0000000..74eeae6
+--- /dev/null
++++ b/bsd/dev/sweet_gpu.h
+@@ -0,0 +1,109 @@
++/*
++ * Adreno 530 kernel API (bsd/dev/sweet_gpu.c), used by the SweetGPU user
++ * client (iokit/Kernel/arm/SweetGPU.cpp). The struct is also the user
++ * client's quad argument, so its layout is ABI.
++ */
++#ifndef _SWEET_GPU_H
++#define _SWEET_GPU_H
++
++#include <sys/cdefs.h>
++#include <stdint.h>
++#include <stdbool.h>
++
++__BEGIN_DECLS
++
++/*
++ * Textured quad: for each pixel (X, Y) of the dst rect (x0, y0, w, h) on
++ * the inner side of the nedges edges (a (X+.5) + b (Y+.5) + c >= 0),
++ * (u, v) = (m[0] m[2]; m[1] m[3]) (X + .5, Y + .5) + (m[4], m[5]) in src
++ * texels (unnormalized), s = bilinear (flags bit 0: nearest) sample of src,
++ * clamped to its edge, channels picked by src_swiz, times color (per
++ * channel); dst = s + dst * (1 - s.a) (source-over; flags SWEET_GPU_QUAD_ADD:
++ * min(s + dst, 1), SWEET_GPU_QUAD_COPY: s). dst is 4 bytes per pixel,
++ * premultiplied, alpha in byte 3 (BGRA8 or RGBA8); src is src_fmt. Images at
++ * GPU VAs from sweet_gpu_vm_map (64-byte aligned); pitches in bytes, multiples
++ * of 64 (the texture unit rounds a pitch up to 64: with any other pitch it
++ * reads past the image, faults and hangs, 0140a). dst must be in a writable
++ * mapping.
++ */
++struct sweet_gpu_quad {
++	uint64_t src_va, dst_va;
++	uint32_t src_w, src_h, src_pitch;
++	uint32_t dst_w, dst_h, dst_pitch;
++	uint32_t x0, y0, w, h;
++	uint32_t m[6];          /* float bits: a, b, c, d, tx, ty */
++	uint32_t reserved;      /* 0 (was opacity: use color) */
++	uint32_t flags;
++	uint32_t color[4];      /* float bits, per channel in memory order */
++	uint32_t src_fmt;       /* SWEET_GPU_FMT_* */
++	uint32_t src_swiz;      /* 4 x 3 bits, channel x first: 0-3 texel x y z w, 4 = 0, 5 = 1 (0x688 = xyzw) */
++	uint32_t nedges;        /* 0-4 */
++	uint32_t edge[4][3];    /* float bits a, b, c */
++};
++
++#define SWEET_GPU_FMT_RGBA8     0u      /* 4 bytes per pixel */
++#define SWEET_GPU_FMT_R8        1u      /* 1 byte */
++#define SWEET_GPU_FMT_RG8       2u      /* 2 bytes */
++
++#define SWEET_GPU_QUAD_NEAREST  1u
++#define SWEET_GPU_QUAD_ADD      2u
++#define SWEET_GPU_QUAD_COPY     4u
++
++/* True once the GPU is up (sweetgpu=8) and accepts work. */
++bool sweet_gpu_ready(void);
++
++/*
++ * Map npages pages (PAGE_SIZE each) at a new GPU VA; 0 on failure. A
++ * read-only mapping can only be a quad source (SMMU entries read-only).
++ */
++uint64_t sweet_gpu_vm_map(const uint64_t *pa, uint32_t npages, bool readonly);
++
++/* Unmap a VA returned by sweet_gpu_vm_map. */
++void sweet_gpu_vm_unmap(uint64_t va);
++
++/*
++ * Run one quad and wait for it; 0 on success, else an errno value. After a
++ * timeout (GPU hung) the service is off until reboot: ENXIO from then on.
++ */
++int sweet_gpu_quad(const struct sweet_gpu_quad *q);
++
++/*
++ * Command submission for user-space drivers (Mesa freedreno through the
++ * SweetGPU user client). Each IB is a CP_INDIRECT_BUFFER_PFE of dwords
++ * dwords at a GPU VA inside a mapping; after them the ring writes the
++ * submit's sequence number to the fence page (CACHE_FLUSH_TS). Returns 0
++ * and the sequence number, ENXIO (GPU off), EINVAL, EFAULT (IB outside the
++ * mapped window) or ETIMEDOUT (ring full for 500 ms: hung, service off).
++ */
++struct sweet_gpu_ib {
++	uint64_t iova;
++	uint32_t dwords;
++	uint32_t pad;
++};
++#define SWEET_GPU_MAX_IBS       256u
++
++int sweet_gpu_submit(const struct sweet_gpu_ib *ib, uint32_t n, uint32_t *seqno);
++
++/*
++ * Wait until submit seqno has completed: 0, ETIMEDOUT after timeout_ms, or
++ * ENXIO (GPU off; also when the fence has not moved for 2 s with work
++ * outstanding: the GPU is declared hung and the service goes off).
++ */
++int sweet_gpu_wait(uint32_t seqno, uint32_t timeout_ms);
++
++struct sweet_gpu_info {
++	uint32_t chip_id;               /* core << 24 | major << 16 | minor << 8 | patch */
++	uint32_t gmem_size;
++	uint64_t gmem_base;
++	uint64_t max_freq;              /* Hz */
++	uint64_t fence_pa;              /* page: u32 last completed seqno at +0 */
++};
++
++void sweet_gpu_get_info(struct sweet_gpu_info *info);
++
++/* The fence page (SweetGPU allocates it so that it can map it into clients). */
++void sweet_gpu_set_fence_page(uintptr_t kva, uint64_t pa);
++
++__END_DECLS
++
++#endif /* _SWEET_GPU_H */
+diff --git a/bsd/dev/sweet_gpu_shaders.h b/bsd/dev/sweet_gpu_shaders.h
+new file mode 100644
+index 0000000..a01b8cd
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_shaders.h
+@@ -0,0 +1,153 @@
++/*
++ * Adreno 530 compute kernels for sweet_gpu.c, generated by tools/ir3asm
++ * (tools/build-ir3asm.sh) from tools/gpu-shaders/*.asm. Do not edit.
++ */
++/* k_fill: generated by tools/ir3asm from tools/gpu-shaders/fill.asm */
++static const uint32_t k_fill_bin[32] = {
++	0x5a5a0000, 0x204cc00d, 0x00000000, 0x204cc009, 0x200600c0, 0x46d00004, 0x00000000, 0x00000200,
++	0x00000004, 0x42100004, 0x00000000, 0x00000200, 0x20020004, 0x46d00008, 0x000d0004, 0x43f0000c,
++	0x00000000, 0x00000500, 0x04000619, 0xc7260008, 0x00000000, 0x03000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++};
++static const struct sweet_kernel k_fill = {
++	.bin = k_fill_bin, .size = sizeof(k_fill_bin),
++	.instrlen = 1, .constlen = 0, .max_reg = 3, .max_half_reg = -1,
++	.double_threadsize = 1, .branchstack = 0,
++	.local = {64, 1, 1}, .localid_regid = 0x0, .wgid_regid = 0xc0, .num_bufs = 1,
++};
++/* k_blend: generated by tools/ir3asm from tools/gpu-shaders/blend.asm */
++static const uint32_t k_blend_bin[128] = {
++	0x00000000, 0x204cc009, 0x00ff00ff, 0x204cc014, 0x00800080, 0x204cc015, 0x000000ff, 0x204cc016,
++	0x200600c0, 0x46d00004, 0x00000000, 0x00000200, 0x00000004, 0x42100004, 0x00000000, 0x00000200,
++	0x20020004, 0x46d00008, 0x00000000, 0x00000500, 0x04020600, 0xc6e6000c, 0x04020600, 0xc6e6020d,
++	0x2018000c, 0x56f00010, 0x2008000d, 0x46f00012, 0x0014000d, 0x43900011, 0x00000000, 0x00000100,
++	0x00100016, 0x42500010, 0x00140012, 0x43900012, 0x00000000, 0x00000200, 0x00100011, 0x46100011,
++	0x00100012, 0x46100012, 0x00000000, 0x00000200, 0x20080011, 0x46f00013, 0x20080012, 0x46f00018,
++	0x00000000, 0x00000200, 0x00140013, 0x43900013, 0x00140018, 0x43900018, 0x00000000, 0x00000200,
++	0x00130011, 0x42100011, 0x00180012, 0x42100012, 0x00000000, 0x00000200, 0x00150011, 0x42100011,
++	0x00150012, 0x42100012, 0x00000000, 0x00000200, 0x20080011, 0x46f00011, 0x20080012, 0x46f00012,
++	0x00000000, 0x00000200, 0x00140011, 0x43900011, 0x00140012, 0x43900012, 0x00000000, 0x00000200,
++	0x20080012, 0x46d00012, 0x00000000, 0x00000200, 0x00120011, 0x43b00011, 0x00000000, 0x00000200,
++	0x0011000c, 0x4210000c, 0x00000000, 0x00000500, 0x04000619, 0xc7260208, 0x00000000, 0x03000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++};
++static const struct sweet_kernel k_blend = {
++	.bin = k_blend_bin, .size = sizeof(k_blend_bin),
++	.instrlen = 3, .constlen = 0, .max_reg = 6, .max_half_reg = -1,
++	.double_threadsize = 1, .branchstack = 0,
++	.local = {64, 1, 1}, .localid_regid = 0x0, .wgid_regid = 0xc0, .num_bufs = 2,
++};
++/* k_blend4: generated by tools/ir3asm from tools/gpu-shaders/blend4.asm */
++static const uint32_t k_blend4_bin[96] = {
++	0x00000000, 0x204cc009, 0x00ff00ff, 0x204cc014, 0x00800080, 0x204cc015, 0x000000ff, 0x204cc016,
++	0x200600c0, 0x46d00004, 0x00000000, 0x00000200, 0x00000004, 0x42100004, 0x00000000, 0x00000200,
++	0x20040004, 0x46d00008, 0x20020004, 0x46d00005, 0x00000000, 0x00000500, 0x05023600, 0xc6e6000c,
++	0x05023600, 0xc6e6021c, 0x2018000c, 0x56f00b20, 0x2008001c, 0x46f00b24, 0x00200016, 0x42580320,
++	0x0014001c, 0x43900b28, 0x00140024, 0x43900b24, 0x00200028, 0x46180b28, 0x00200024, 0x46180b24,
++	0x20080028, 0x46f00b2c, 0x20080024, 0x46f00b30, 0x0014002c, 0x43900b2c, 0x00140030, 0x43900b30,
++	0x002c0028, 0x42180b28, 0x00300024, 0x42180b24, 0x00150028, 0x42100b28, 0x00150024, 0x42100b24,
++	0x20080028, 0x46f00b28, 0x20080024, 0x46f00b24, 0x00140028, 0x43900b28, 0x00140024, 0x43900b24,
++	0x20080024, 0x46d00b24, 0x00240028, 0x43b80b28, 0x0028000c, 0x42180b0c, 0x00000000, 0x00000500,
++	0x05003619, 0xc7260208, 0x00000000, 0x03000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++};
++static const struct sweet_kernel k_blend4 = {
++	.bin = k_blend4_bin, .size = sizeof(k_blend4_bin),
++	.instrlen = 3, .constlen = 0, .max_reg = 12, .max_half_reg = -1,
++	.double_threadsize = 0, .branchstack = 0,
++	.local = {64, 1, 1}, .localid_regid = 0x0, .wgid_regid = 0xc0, .num_bufs = 2,
++};
++/* k_sample: generated by tools/ir3asm from tools/gpu-shaders/sample.asm */
++static const uint32_t k_sample_bin[160] = {
++	0x00000000, 0x202cc028, 0x00000001, 0x202cc029, 0x00000002, 0x202cc02a, 0x00000003, 0x202cc02b,
++	0x00000004, 0x202cc02c, 0x00000005, 0x202cc02d, 0x00000006, 0x202cc02e, 0x00000007, 0x202cc02f,
++	0x00000008, 0x202cc030, 0x00000009, 0x202cc031, 0x0000000a, 0x202cc032, 0x0000000b, 0x202cc033,
++	0x0000000c, 0x202cc034, 0x0000000d, 0x202cc035, 0x0000000e, 0x202cc036, 0x0000000f, 0x202cc037,
++	0x00000000, 0x204cc009, 0x200600c0, 0x46d00004, 0x00000000, 0x00000200, 0x00000004, 0x42100004,
++	0x003500c1, 0x42100005, 0x00000000, 0x00000100, 0x00320004, 0x42d00004, 0x00000000, 0x00000200,
++	0x00340004, 0x42100004, 0x00000000, 0x00000200, 0x00040005, 0x62198006, 0x00000004, 0x200c400c,
++	0x00000005, 0x200c400d, 0x00000000, 0x00000100, 0x0031000c, 0x4010000c, 0x0031000d, 0x4010000d,
++	0x20020006, 0x46d00008, 0x00000000, 0x00000100, 0x002c0028, 0x63860010, 0x002d0029, 0x63860011,
++	0x00000000, 0x00000200, 0x0010002a, 0x63868010, 0x0011002b, 0x63868011, 0x00000000, 0x00000200,
++	0x00000021, 0xa0c01f14, 0x02200019, 0xa0c01f18, 0x002e0014, 0x50700b14, 0x00000000, 0x00000200,
++	0x00374017, 0x639b001c, 0x00000000, 0x00000200, 0x20140018, 0x638e0b20, 0x00310020, 0x63980b20,
++	0x00300020, 0x40300b20, 0x00000020, 0x2004cb24, 0x00000000, 0x00000200, 0x20080025, 0x46d00025,
++	0x20100026, 0x46d00026, 0x20180027, 0x46d00027, 0x00000000, 0x00000200, 0x00250024, 0x43b00024,
++	0x00270026, 0x43b00026, 0x00000000, 0x00000200, 0x00260024, 0x43b00024, 0x00000000, 0x00000500,
++	0x06000649, 0xc7260008, 0x00000000, 0x03000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++};
++static const struct sweet_kernel k_sample = {
++	.bin = k_sample_bin, .size = sizeof(k_sample_bin),
++	.instrlen = 4, .constlen = 4, .max_reg = 13, .max_half_reg = -1,
++	.double_threadsize = 0, .branchstack = 0,
++	.local = {64, 1, 1}, .localid_regid = 0x0, .wgid_regid = 0xc0, .num_bufs = 1,
++};
++/* k_sample4: generated by tools/ir3asm from tools/gpu-shaders/sample4.asm */
++static const uint32_t k_sample4_bin[416] = {
++	0x00000000, 0x202cc028, 0x00000001, 0x202cc029, 0x00000002, 0x202cc02a, 0x00000003, 0x202cc02b,
++	0x00000004, 0x202cc02c, 0x00000005, 0x202cc02d, 0x00000006, 0x202cc02e, 0x00000007, 0x202cc02f,
++	0x00000008, 0x202cc030, 0x00000009, 0x202cc031, 0x0000000a, 0x202cc032, 0x0000000b, 0x202cc033,
++	0x0000000c, 0x202cc034, 0x0000000d, 0x202cc035, 0x0000000e, 0x202cc036, 0x0000000f, 0x202cc037,
++	0x00000010, 0x202cc038, 0x00000011, 0x202cc039, 0x00000012, 0x202cc03a, 0x00000013, 0x202cc03b,
++	0x00000014, 0x202cc064, 0x00000015, 0x202cc065, 0x00000016, 0x202cc066, 0x00000017, 0x202cc067,
++	0x00000018, 0x202cc068, 0x00000019, 0x202cc069, 0x0000001a, 0x202cc06a, 0x0000001c, 0x202cc06c,
++	0x0000001d, 0x202cc06d, 0x0000001e, 0x202cc06e, 0x00000020, 0x202cc070, 0x00000021, 0x202cc071,
++	0x00000022, 0x202cc072, 0x00000024, 0x202cc074, 0x00000025, 0x202cc075, 0x00000026, 0x202cc076,
++	0x00000028, 0x202cc07c, 0x00000000, 0x204cc009, 0x200600c0, 0x46d00004, 0x00000000, 0x00000200,
++	0x00000004, 0x42100004, 0x003500c1, 0x42100005, 0x00000000, 0x00000100, 0x00320004, 0x42d00004,
++	0x00000000, 0x00000200, 0x20020004, 0x46d00004, 0x00000000, 0x00000200, 0x00340004, 0x42100006,
++	0x00000000, 0x00000200, 0x00060005, 0x62198007, 0x00000006, 0x200c400c, 0x00000005, 0x200c400d,
++	0x00000038, 0x200c4038, 0x00000039, 0x200c4039, 0x00000000, 0x00000100, 0x20020007, 0x46d00008,
++	0x0031000c, 0x4010000c, 0x0031000d, 0x4010000d, 0x40380031, 0x40100038, 0x00310039, 0x40100039,
++	0x00000000, 0x00000100, 0x002f000c, 0x4010000e, 0x0000000d, 0x2004400f, 0x0000000d, 0x20044011,
++	0x0000000d, 0x20044013, 0x00000000, 0x00000100, 0x002f000e, 0x40100010, 0x00000000, 0x00000200,
++	0x002f0010, 0x40100012, 0x006a0069, 0x63868078, 0x006e006d, 0x63868079, 0x00720071, 0x6386807a,
++	0x00760075, 0x6386807b, 0x002c002a, 0x6386801c, 0x002d002b, 0x6386801d, 0x00000000, 0x00000200,
++	0x001c0028, 0x63860014, 0x001d0029, 0x63860015, 0x001c0028, 0x63870016, 0x001d0029, 0x63870017,
++	0x001c0028, 0x63880018, 0x001d0029, 0x63880019, 0x001c0028, 0x6389001a, 0x001d0029, 0x6389001b,
++	0x0000000c, 0x2004403c, 0x0000000e, 0x2004403d, 0x00000010, 0x2004403e, 0x00000012, 0x2004403f,
++	0x00000000, 0x00000200, 0x00000029, 0xa0c01f40, 0x0000002d, 0xa0c01f44, 0x00000031, 0xa0c01f48,
++	0x00000035, 0xa0c01f4c, 0x02200019, 0xa0c01f50, 0x0220001d, 0xa0c01f54, 0x02200021, 0xa0c01f58,
++	0x02200025, 0xa0c01f5c, 0x0038003c, 0x40100b20, 0x0039003c, 0x639d0b24, 0x003b0020, 0x40500b20,
++	0x003b0024, 0x40500b24, 0x002f0020, 0x40300b20, 0x002f0024, 0x40300b24, 0x00240020, 0x40780b20,
++	0x0078003c, 0x63b40b24, 0x00000000, 0x00000200, 0x002f0024, 0x63be0b24, 0x003b0024, 0x40500b24,
++	0x002f0024, 0x40300b24, 0x00240020, 0x40780b20, 0x0079003c, 0x63b60b24, 0x00000000, 0x00000200,
++	0x002f0024, 0x63be0b24, 0x003b0024, 0x40500b24, 0x002f0024, 0x40300b24, 0x00240020, 0x40780b20,
++	0x007a003c, 0x63b80b24, 0x00000000, 0x00000200, 0x002f0024, 0x63be0b24, 0x003b0024, 0x40500b24,
++	0x002f0024, 0x40300b24, 0x00240020, 0x40780b20, 0x007b003c, 0x63ba0b24, 0x00000000, 0x00000200,
++	0x002f0024, 0x63be0b24, 0x003b0024, 0x40500b24, 0x002f0024, 0x40300b24, 0x00240020, 0x40780b20,
++	0x00000000, 0x00000200, 0x002f0020, 0x639b8b1c, 0x00640040, 0x50780b40, 0x00640044, 0x40780b44,
++	0x00640048, 0x40780b48, 0x0064004c, 0x40780b4c, 0x00200040, 0x40700b40, 0x00210044, 0x40700b44,
++	0x00220048, 0x40700b48, 0x0023004c, 0x40700b4c, 0x00000000, 0x00000200, 0x001c4043, 0x639b001c,
++	0x001d4047, 0x639b001d, 0x001e404b, 0x639b001e, 0x001f404f, 0x639b001f, 0x00000000, 0x00000200,
++	0x20400050, 0x638e0b50, 0x20440054, 0x638e8b54, 0x20480058, 0x638f0b58, 0x204c005c, 0x638f8b5c,
++	0x00310050, 0x63980b50, 0x00310054, 0x63980b54, 0x00310058, 0x63980b58, 0x0031005c, 0x63980b5c,
++	0x00300050, 0x40300b50, 0x00300054, 0x40300b54, 0x00300058, 0x40300b58, 0x0030005c, 0x40300b5c,
++	0x00000050, 0x2004cb50, 0x00000054, 0x2004cb54, 0x00000058, 0x2004cb58, 0x0000005c, 0x2004cb5c,
++	0x00000000, 0x00000200, 0x20080051, 0x46d00051, 0x20080055, 0x46d00055, 0x20080059, 0x46d00059,
++	0x2008005d, 0x46d0005d, 0x20100052, 0x46d00052, 0x20100056, 0x46d00056, 0x2010005a, 0x46d0005a,
++	0x2010005e, 0x46d0005e, 0x20180053, 0x46d00053, 0x20180057, 0x46d00057, 0x2018005b, 0x46d0005b,
++	0x2018005f, 0x46d0005f, 0x00510050, 0x43b00050, 0x00550054, 0x43b00054, 0x00590058, 0x43b00058,
++	0x005d005c, 0x43b0005c, 0x00530052, 0x43b00052, 0x00570056, 0x43b00056, 0x005b005a, 0x43b0005a,
++	0x005f005e, 0x43b0005e, 0x00000000, 0x00000200, 0x00520050, 0x43b00060, 0x00560054, 0x43b00061,
++	0x005a0058, 0x43b00062, 0x005e005c, 0x43b00063, 0x00000000, 0x00000500, 0x070036c1, 0xc7260008,
++	0x00000000, 0x03000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++};
++static const struct sweet_kernel k_sample4 = {
++	.bin = k_sample4_bin, .size = sizeof(k_sample4_bin),
++	.instrlen = 12, .constlen = 12, .max_reg = 31, .max_half_reg = -1,
++	.double_threadsize = 0, .branchstack = 0,
++	.local = {64, 1, 1}, .localid_regid = 0x0, .wgid_regid = 0xc0, .num_bufs = 1,
++};
+diff --git a/bsd/dev/vince_input.c b/bsd/dev/vince_input.c
+index bcae107..9ff6171 100644
+--- a/bsd/dev/vince_input.c
++++ b/bsd/dev/vince_input.c
+@@ -47,6 +47,9 @@ extern void sweet_hid_key(int key, int down);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void vince_input_start(void);
+ extern void vince_adreno_init(void);
++#if defined(KUGO)
++extern void sweet_gpu_init(void);     /* sweet_gpu.c: Adreno 510, boot-arg sweetgpu=N */
++#endif
+ 
+ #define SPMI_CORE_PA    0x0200f000u
+ #define SPMI_CNFG_PA    0x0200a000u
+@@ -561,7 +564,11 @@ vince_input_start(void)
+ 		return;
+ 	}
+ 	input_started = true;
++#if defined(KUGO)
++	sweet_gpu_init();
++#else
+ 	vince_adreno_init();
++#endif
+ 	(void)PE_parse_boot_argn("vincekeys", &keys, sizeof(keys));
+ 	(void)PE_parse_boot_argn("vincetouch", &touch, sizeof(touch));
+ 	tlmm = ml_io_map(TLMM_PA, TLMM_SIZE);
