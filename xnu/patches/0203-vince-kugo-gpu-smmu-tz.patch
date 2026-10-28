@@ -1,0 +1,66 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index a2fd1cf..ca1c077 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -468,6 +468,34 @@ cp_state(vm_offset_t gpu, const char *when)
+ 
+ static uint64_t *g_l1, g_l1_pa;  /* context bank 0 L1 table (64 x 1 GB) */
+ 
++#if defined(KUGO)
++/*
++ * kugo's GPU SMMU (MMU-500, live DT qsmmu-v500, qcom,tz-device-id GPU, skip-init, enable-static-cb):
++ * TrustZone owns the global registers (a CBAR0 write was an SError, gpu-xnu5) and has already routed
++ * the GPU stream to context bank 0 (SMR0 84000000, S2CR0 30000000). LK leaves CB0 off (SCTLR.M 0):
++ * the GPU then reaches physical memory untranslated, the identity map sailfish builds by hand. So the
++ * bring-up runs in that bypass; the GPU VA window (vm_init) needs CB0 translation, tried later.
++ */
++static bool g_smmu_bypass;
++
++static bool
++smmu_identity(vm_offset_t smmu)
++{
++	vm_offset_t cb = smmu + 0x8000;
++	uint32_t sctlr = rd(cb, 0x0);
++	printf("SWEET GPU: SMMU CB0 SCTLR %08x TCR2 %08x TTBR0 %08x%08x TCR %08x MAIR0 %08x FSR %08x\n", sctlr,
++	    rd(cb, 0x10), rd(cb, 0x24), rd(cb, 0x20), rd(cb, 0x30), rd(cb, 0x38), rd(cb, 0x58));
++	if (sctlr & 1u) {
++		printf("SWEET GPU: SMMU CB0 already translating, not ours: stop\n");
++		return false;
++	}
++	g_smmu_bypass = true;
++	printf("SWEET GPU: SMMU CB0 off: GPU addresses are physical (bypass)\n");
++	return true;
++}
++#define smmu_identity smmu_identity_pixel
++#endif
++
+ static bool
+ smmu_identity(vm_offset_t smmu)
+ {
+@@ -522,6 +550,10 @@ smmu_identity(vm_offset_t smmu)
+ 	return ok;
+ }
+ 
++#if defined(KUGO)
++#undef smmu_identity
++#endif
++
+ static void
+ smmu_faults(vm_offset_t smmu, const char *when)
+ {
+@@ -870,6 +902,15 @@ pt4k(uint64_t *pa)
+ static void
+ smmu_tlb_flush(void)
+ {
++#if defined(KUGO)
++	/* context bank 0's own invalidate and sync (the global ones are TrustZone's) */
++	if (!g_smmu_bypass) {
++		wr(g_smmu + 0x8000, 0x618, 0);          /* CB_TLBIALL */
++		wr(g_smmu + 0x8000, 0x7f0, 0);          /* CB_TLBSYNC */
++		(void)poll(g_smmu + 0x8000, 0x7f4, 1u, 0, 10);
++	}
++	return;
++#endif
+ 	wr(g_smmu, 0x68, 0);    /* TLBIALLNSNH */
+ 	wr(g_smmu, 0x70, 0);    /* sTLBGSYNC */
+ 	(void)poll(g_smmu, 0x74, 1u, 0, 10);
