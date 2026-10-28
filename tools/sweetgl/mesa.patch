@@ -1,0 +1,48 @@
+diff --git a/src/freedreno/drm/freedreno_bo.c b/src/freedreno/drm/freedreno_bo.c
+index 6eda810..ab48aa0 100644
+--- a/src/freedreno/drm/freedreno_bo.c
++++ b/src/freedreno/drm/freedreno_bo.c
+@@ -12,6 +12,13 @@
+ #include "freedreno_drm_perfetto.h"
+ #include "freedreno_priv.h"
+ 
++#ifdef __APPLE__
++void *sweet_drm_bo_map(int fd, uint64_t offset);
++#undef os_mmap
++#define os_mmap(addr, length, prot, flags, fd, offset) sweet_drm_bo_map(fd, offset)
++#define os_munmap(addr, length) 0
++#endif
++
+ simple_mtx_t table_lock = SIMPLE_MTX_INITIALIZER;
+ simple_mtx_t fence_lock = SIMPLE_MTX_INITIALIZER;
+ 
+diff --git a/src/freedreno/meson.build b/src/freedreno/meson.build
+index e8f01b8..a6c37f9 100644
+--- a/src/freedreno/meson.build
++++ b/src/freedreno/meson.build
+@@ -22,7 +22,7 @@ subdir('ir2')
+ subdir('ir3')
+ subdir('fdl')
+ 
+-if system_has_kms_drm
++if system_has_kms_drm or host_machine.system() == 'darwin'
+   subdir('drm')
+ endif
+ 
+diff --git a/src/gallium/drivers/freedreno/freedreno_resource.c b/src/gallium/drivers/freedreno/freedreno_resource.c
+index 29134ba..0c3fdbb 100644
+--- a/src/gallium/drivers/freedreno/freedreno_resource.c
++++ b/src/gallium/drivers/freedreno/freedreno_resource.c
+@@ -1745,6 +1745,12 @@ fd_layout_resource_for_handle(struct fd_resource *rsc, struct winsys_handle *han
+    else
+       rsc->layout.pitchalign = MAX2(rsc->layout.pitchalign, 5);
+ 
++#ifdef __APPLE__
++   if (is_a5xx(screen) && handle->modifier == DRM_FORMAT_MOD_LINEAR &&
++       handle->stride % 64 == 0)
++      rsc->layout.pitchalign = 6;
++#endif
++
+    if (rsc->layout.pitch0 < (prsc->width0 * rsc->layout.cpp) ||
+        fd_resource_pitch(rsc, 0) != rsc->layout.pitch0)
+       return false;

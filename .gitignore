@@ -10,3 +10,7 @@ out/
 *.dSYM
 *.log
 .DS_Store
+
+# sweetgl build (on the Mac): Mesa tree, tools, generated cross file
+research/
+tools/sweetgl/ios-cross.txt
