@@ -192,12 +192,15 @@ def build_kugo_adt(seed=None, product_from=None, ncpus=1, identity='iphone8'):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr('qcom,' + model) + cstr('ARM,v8') + b'\0'),
+            # SweetCPU matches 'qcom,cortex-a53' (KernelConfigTables): the A72 lists it second, or its nub
+            # never starts and the boot waits for all CPUs forever (the watchdog bites after a minute)
+            ('compatible', cstr('qcom,' + model) + (cstr('qcom,cortex-a53') if mpidr >> 8 else b'') +
+             cstr('ARM,v8') + b'\0'),
             ('reg', u32(mpidr)),
             ('cpu-id', u32(core)),
             ('cluster-id', u32(mpidr >> 8)),
             ('cluster-type', u32(0)),
-            ('die-cluster-id', u32(mpidr >> 8)),
+            ('die-cluster-id', u32(0)),          # one die, as ios-vince's two A53 clusters
             ('cluster-core-id', u32(mpidr & 0xff)),
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(TIMEBASE)),

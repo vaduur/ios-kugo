@@ -1,0 +1,45 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 665611d..eebe8fd 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -194,7 +194,7 @@ vince_cpu_clock_init(void)
+  * from VDD_APC1 beyond what LK left (Linux runs the A72s at 400-883 MHz on corner 1-2).
+  */
+ static void
+-kugo_cpu_clocks(void)
++kugo_cpu_clocks(bool switch_a72)
+ {
+ 	static const uint32_t mux_pa[3] = {0x0b111000, 0x0b011000, 0x0b1d1000};
+ 	static const uint32_t pll_pa[3] = {0x0b116000, 0x0b016000, 0x0b1d0000};
+@@ -213,7 +213,7 @@ kugo_cpu_clocks(void)
+ 	int a72 = 0;
+ 	PE_parse_boot_argn("kugoa72", &a72, sizeof(a72));
+ 	uint32_t cfg0 = mux[0][1], old = mux[1][1];
+-	if (!a72) {
++	if (!a72 || !switch_a72) {
+ 		return;
+ 	}
+ 	if (((old >> 8) & 7) != 0 || ((cfg0 >> 8) & 7) != 4) {
+@@ -341,8 +341,8 @@ SweetCPU::start(IOService *provider)
+ #if defined(VINCE)
+ 	if (boot) {
+ #if defined(KUGO)
+-		/* MSM8956 clusters (A53 / A72) have their own PLLs and muxes: logged, the A72 one on request */
+-		kugo_cpu_clocks();
++		/* MSM8956 clusters (A53 / A72) have their own PLLs and muxes: logged (the A72 one moves in finishStart) */
++		kugo_cpu_clocks(false);
+ 		vm_offset_t marks = ml_io_map(KUGO_CTL_PAGE_PHYS, 0x1000);
+ #else
+ 		vince_cpu_clock_init();
+@@ -418,6 +418,11 @@ SweetCPU::finishStart(const ml_topology_info_t *topology)
+ 	    gVinceMHz[0], gVinceMHz[1], gVinceMHz[2], gVinceMHz[3], gVinceMHz[4], gVinceMHz[5], gVinceMHz[6],
+ 	    gVinceMHz[7]);
+ #if defined(KUGO)
++	/*
++	 * Only now: VDD_APC1 is off until PSCI CPU_ON powers the A72 cluster (then 1000 mV, measured), so the
++	 * cluster runs on XO up to here and gets GPLL0 once its CPU is in.
++	 */
++	kugo_cpu_clocks(true);
+ 	kugo_reset_start();
+ #endif
+ }
