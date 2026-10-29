@@ -1,0 +1,65 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 55e79dd..cfccffa 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1958,8 +1958,31 @@ static bool
+ gfx_raise(int mhz)
+ {
+ #if defined(KUGO)
+-	(void)mhz;
+-	return false;   /* not yet: needs the CPR corner for >266 MHz */
++	/*
++	 * GPLL0 (800 MHz) / 2.5 = 320 MHz inside the 366 MHz corner 5, / 2 = 400 MHz inside the 432 MHz corner 6
++	 * (gcc-gfx qcom,gfxfreq-corner-v0). GFX rail (PM8004 S5) first to that corner's CPR ceiling (live DT
++	 * regulator@98000: 1010 / 1050 mV; open loop, no CPR), read back, then the divider. VDD_MX must be at
++	 * SVS_L1 / nominal for these (vdd-mx-corner-map); it is RPM's, printed at boot, not voted here.
++	 */
++	uint32_t mv = mhz >= 400 ? 1050 : 1010, field = mhz >= 400 ? 3 : 4;
++	uint8_t v = 0;
++	uint8_t vset = (uint8_t)((mv - 80) / 5);
++	if (mhz != 320 && mhz != 400) {
++		return false;
++	}
++	if (!sweet_pmic_write(GFX_S2, 0x41, vset)) {
++		return false;
++	}
++	delay(4000);
++	if (!sweet_pmic_read(GFX_S2, 0x41, &v) || v != vset) {
++		printf("SWEET GPU: S5 vset %u, want %u: clock stays\n", v, vset);
++		return false;
++	}
++	wr(mmcc, G_GFX3D_CFG, (1u << 8) | field);
++	wr(mmcc, G_GFX3D_CMD, rd(mmcc, G_GFX3D_CMD) | 1u);
++	bool ok = poll(mmcc, G_GFX3D_CMD, 1u, 0, 10);
++	printf("SWEET GPU: gfx3d %u MHz at S5 %u mV: %s\n", mhz, mv, ok ? "ok" : "RCG update FAILED");
++	return ok;
+ #endif
+ 	uint8_t sub = 0, v = 0;
+ 	uint32_t mv = mhz == 600 ? 1015 : 825;
+@@ -2410,7 +2433,7 @@ cp_test(vm_offset_t gpu, int level)
+ 			(void)PE_parse_boot_argn("sweetgpuclk", &mhz, sizeof(mhz));
+ 			g_max_mhz = 300;
+ 			uint64_t us300 = quad_bench();
+-			if (mhz == 400 || mhz == 600) {
++			if (mhz == 320 || mhz == 400 || mhz == 600) {     /* 320: kugo only */
+ 				lck_mtx_lock(&sweet_gpu_vm_lock);
+ 				bool ok = gfx_raise(mhz);
+ 				lck_mtx_unlock(&sweet_gpu_vm_lock);
+@@ -2549,6 +2572,17 @@ gpu_thread(void *arg, wait_result_t result)
+ 	printf("SWEET GPU: A510, PM8004 S5 %s type %02x subtype %02x status %02x range %02x vset %02x mode %02x en %02x\n",
+ 	    s5ok ? "ok" : "UNREADABLE", s5[0], s5[1], s5[2], s5[3], s5[4], s5[5], s5[6]);
+ 	kugo_dump(g, "at boot:");
++	{
++		/* VDD_MX (PM8950 S6, RPM-owned: read only): its level bounds the GPU clock (vdd-mx-corner-map) */
++		uint8_t mx[4] = {0};
++		static const uint8_t mxregs[4] = {0x04, 0x05, 0x40, 0x41};
++		bool mxok = true;
++		for (int i = 0; i < 4; i++) {
++			mxok = mxok && sweet_pmic_read(0x023, mxregs[i], &mx[i]);
++		}
++		printf("SWEET GPU: VDD_MX PM8950 S6 %s type %02x subtype %02x range %02x vset %02x\n",
++		    mxok ? "ok" : "UNREADABLE", mx[0], mx[1], mx[2], mx[3]);
++	}
+ 	if (!s5ok || s5[3] != 0) {
+ 		printf("SWEET GPU: S5 unreadable or not range 0, stop\n");
+ 		return;
