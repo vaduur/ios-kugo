@@ -1,0 +1,193 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4608a36..55de18d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -49,7 +49,12 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
++#include <kern/thread_call.h>
+ #include <sys/proc.h>
++#if defined(KUGO)
++/* sweet_gpu.c: clean+invalidate to the point of coherency (the kernel's flush_dcache64 is a bare DSB here) */
++extern "C" void kugo_flush_dcache64(addr64_t addr, unsigned len, boolean_t phys);
++#endif
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -144,6 +149,18 @@ public:
+ 	uint32_t      fShadowW, fShadowH, fOutW, fBarX;
+ 	uint16_t     *fXMap, *fYMap;
+ 	void flushPanel(void);
++#if defined(KUGO)
++	/*
++	 * kugo: the CPU copy and the panel kick took longer than a vsync, and running them in the vsync timer
++	 * held back the vsync notifications too, so CoreAnimation drew only as often as the panel was fed. The
++	 * vsync timer now hands the latest swap to fPresentCall (one at a time) and keeps its 60 Hz.
++	 */
++	thread_call_t fPresentCall;
++	uint8_t       fShow[SWEET_FB_SWAP_REC_SIZE];
++	bool          fShowPending;
++	uint64_t      fTimeCopy, fTimePack, fTimeKick, fTimeFrames;
++	static void presentCall(thread_call_param_t p0, thread_call_param_t p1);
++#endif
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -279,6 +296,15 @@ AppleCLCD::start(IOService *provider)
+ 		return false;
+ 	}
+ 	uint32_t hz = 10;
++#if defined(KUGO)
++	fPresentCall = thread_call_allocate_with_options(&AppleCLCD::presentCall, this, THREAD_CALL_PRIORITY_HIGH,
++	    THREAD_CALL_OPTIONS_ONCE);
++	if (fPresentCall == NULL) {
++		IOLog("SWEET FB: no present thread call\n");
++		return false;
++	}
++	hz = 60;        /* off the vsync timer: as often as a frame takes */
++#endif
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -338,6 +364,19 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
++#if defined(KUGO)
++	if (flush) {
++		memcpy(fb->fShow, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++		fb->fShowPending = true;
++		fb->fDirty = false;
++	}
++	IOLockUnlock(fb->fLock);
++	if (flush) {
++		thread_call_enter(fb->fPresentCall);    /* coalesces while a frame is still going out */
++	}
++	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	return;
++#endif
+ 	uint8_t *rec = NULL;
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+@@ -403,10 +442,44 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ }
+ 
++#if defined(KUGO)
++void
++AppleCLCD::presentCall(thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	AppleCLCD *fb = (AppleCLCD *)p0;
++	uint8_t *rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
++	if (rec == NULL) {
++		return;
++	}
++	IOLockLock(fb->fLock);
++	bool show = fb->fShowPending && !fb->fPowerOff;
++	if (show) {
++		memcpy(rec, fb->fShow, SWEET_FB_SWAP_REC_SIZE);
++		fb->fShowPending = false;
++	}
++	IOLockUnlock(fb->fLock);
++	if (show) {
++		fb->present(rec);
++	}
++	IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++}
++
++static uint64_t
++sweet_fb_us(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / 1000;
++}
++#endif
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++#if defined(KUGO)
++	uint64_t t0 = mach_absolute_time();
++#endif
+ 
+ 
+ 	if (!fConsolePaused) {
+@@ -486,6 +559,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
++#if defined(KUGO)
++			/* the kernel mapping is cached: drop stale lines over what the GPU wrote (and push the CPU's) */
++			kugo_flush_dcache64((addr64_t)(src + s->offset + (uint64_t)sy * s->bytesPerRow),
++			    (unsigned)((uint64_t)h * s->bytesPerRow), FALSE);
++#endif
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+@@ -494,11 +572,21 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++#if defined(KUGO)
++	fTimeCopy += mach_absolute_time() - t0;
++#endif
+ #if defined(ARM64_BOARD_CONFIG_VINCE)
+ 	if (fPanelBpp == 3) {
+ 		flushPanel();
+ 	}
+ #endif
++#if defined(KUGO)
++	if ((++fTimeFrames & 63) == 0) {
++		printf("SWEET FB: 64 frames: copy %llu us, pack %llu us, kick %llu us per frame\n",
++		    sweet_fb_us(fTimeCopy) / 64, sweet_fb_us(fTimePack) / 64, sweet_fb_us(fTimeKick) / 64);
++		fTimeCopy = fTimePack = fTimeKick = 0;
++	}
++#endif
+ }
+ 
+ #if defined(ARM64_BOARD_CONFIG_VINCE)
+@@ -518,6 +606,9 @@ void
+ AppleCLCD::flushPanel(void)
+ {
+ 	if (fScaled) {
++#if defined(KUGO)
++		uint64_t t0 = mach_absolute_time();
++#endif
+ 		/* nearest sample of the logical display per panel pixel; bars rewritten each time (240 bytes a row) */
+ 		uint32_t barBytes = fBarX * 3, endBytes = (fBarX + fOutW) * 3;
+ 		for (uint32_t y = 0; y < fHeight; y++) {
+@@ -540,7 +631,10 @@ AppleCLCD::flushPanel(void)
+ 			}
+ 		}
+ #if defined(KUGO)
++		uint64_t t1 = mach_absolute_time();
+ 		kugo_panel_kick();
++		fTimePack += t1 - t0;
++		fTimeKick += mach_absolute_time() - t1;
+ #endif
+ 		return;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 40c838e..6194a6d 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -102,12 +102,11 @@ SweetSurface::kernelAddress()
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+ 		/*
+-		 * Client pages in their own mode: write-combining managed pages froze ios-sailfish 0150a. Our own
+-		 * buffers stay write-combining: kugo's framebuffer copies GPU-rendered surfaces with the CPU,
+-		 * and a cached mapping would read stale lines over what the GPU wrote.
++		 * The surface's own mode: write-combining managed (client) pages froze ios-sailfish 0150a. Cached
++		 * for our buffers too: kugo's framebuffer reads every frame with the CPU (uncached reads were most
++		 * of the frame time) and cleans+invalidates the lines first, for what the GPU wrote.
+ 		 */
+-		kernelMap = memory->map((clientMemory ? mapCache : kIOMapWriteCombineCache) |
+-		    (readOnly ? kIOMapReadOnly : 0));
++		kernelMap = memory->map(mapCache | (readOnly ? kIOMapReadOnly : 0));
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
