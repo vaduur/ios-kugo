@@ -1,0 +1,232 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index c4f75f3..d81d8c1 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2600,7 +2600,7 @@ kugo_spmi_apid(uint16_t ppid)
+ 
+ /*
+  * PMIC arbiter v2, one byte: observer channel to read, this EE's channel to write (EXT_WRITEL). The GPU
+- * thread and the CPU clock code (kugo_a53_boost) both use it: one transfer at a time, channel pages
++ * thread and the CPU clock code (kugo_cpu_boost) both use it: one transfer at a time, channel pages
+  * mapped once.
+  */
+ static LCK_GRP_DECLARE(kugo_spmi_grp, "kugo_spmi");
+@@ -2660,64 +2660,72 @@ kugo_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val)
+ }
+ 
+ /*
+- * kugoa53=MHZ (SweetCPU's finishStart): the A53 cluster from LK's GPLL0 (800 MHz) to its own SR PLL at
+- * MHZ rounded down to 19.2 MHz steps, at most 1401.6 (L 73, the top of the DT's c0 table). The PLL is the
+- * block ios-vince runs MSM8953's A53s from at the same address (0x0b116000; mode 0, L 8, user 0x18, config
+- * 0x20/0x24, test 0x30/0x34; mux src 5), so its sequence is reused. VDD_APC0 (PM8950 S5, FTS2.5 range 0:
+- * 80 mV + 5 mV a step; LK leaves 1050 mV, fuse corner 2's ceiling) goes first to 1165 mV, the DT ceiling of
+- * fuse corner 3 (1017.6-1401.6 MHz); without CPR closed loop the ceiling is the safe value. Any failure
+- * leaves the cluster on GPLL0 (and the rail as LK had it).
++ * kugoa53=MHZ / kugoa72=MHZ (SweetCPU's finishStart): a cluster from LK's GPLL0 (800 MHz; SweetCPU moves
++ * the A72s there first) to its own PLL at MHZ in 19.2 MHz steps. All three MSM8976 CPU PLLs are HFPLLs
++ * (upstream clk-hfpll.c / hfpll.c msm8976 data): mode 0 (OUTCTRL 0, BYPASSNL 1, RESET_N 2), L 4, M 8, N
++ * 0xc, user 0x10, config 0x14, status 0x1c with lock in bit 16; A53 902.4-1478.4 MHz, config 0x341600,
++ * user 0x109; A72 940.8-2016 MHz, config 0x4e0405d, user 0x100109. Capped at the DT's tables (A53
++ * 1401.6, A72 1804.8). The cluster mux takes the PLL as src 5 (apcs-msm8916: GPLL0 4, PLL 5). VDD_APCn
++ * (FTS2.5 range 0: 80 mV + 5 mV a step) first goes to 1165 mV, the DT ceiling of fuse corner 3, the
++ * safe value without CPR closed loop. Any failure leaves that cluster on GPLL0 and its rail as it was.
+  */
+-#define KUGO_APC0_PPID  0x120
+-bool kugo_a53_boost(void);
++static const struct kugo_cluster {
++	const char *name, *arg;
++	uint32_t pll_pa, mux_pa, config, user, min_l, max_l;
++	uint16_t apc_ppid;
++} kugo_clusters[2] = {
++	{"A53", "kugoa53", 0x0b116000, 0x0b111000, 0x341600, 0x109, 47, 73, 0x120},
++	{"A72", "kugoa72", 0x0b016000, 0x0b011000, 0x4e0405d, 0x100109, 49, 94, 0x517},
++};
+ 
+-bool
+-kugo_a53_boost(void)
++static bool
++kugo_cluster_boost(const struct kugo_cluster *c)
+ {
+ 	int mhz = 0;
+-	if (!PE_parse_boot_argn("kugoa53", &mhz, sizeof(mhz)) || mhz <= 800) {
++	if (!PE_parse_boot_argn(c->arg, &mhz, sizeof(mhz)) || mhz <= 900) {
+ 		return false;
+ 	}
+ 	uint32_t l = (uint32_t)mhz * 10 / 192;
+-	if (l > 73) {
+-		l = 73;
+-	}
++	l = l < c->min_l ? c->min_l : l > c->max_l ? c->max_l : l;
+ 	uint8_t range = 0xff, v0 = 0, v1 = 0;
+-	if (!kugo_pmic_read(KUGO_APC0_PPID, 0x40, &range) || range != 0 || !kugo_pmic_read(KUGO_APC0_PPID, 0x41, &v0)) {
+-		printf("KUGO CPU: VDD_APC0 range %02x unreadable or not range 0, A53s stay at 800 MHz\n", range);
++	if (!kugo_pmic_read(c->apc_ppid, 0x40, &range) || range != 0 || !kugo_pmic_read(c->apc_ppid, 0x41, &v0)) {
++		printf("KUGO CPU: %s rail range %02x unreadable or not range 0, left at 800 MHz
++", c->name, range);
+ 		return false;
+ 	}
+ 	uint8_t vset = (uint8_t)((1165 - 80) / 5);
+-	bool vok = kugo_pmic_write(KUGO_APC0_PPID, 0x41, vset);
++	bool vok = kugo_pmic_write(c->apc_ppid, 0x41, vset);
+ 	delay(2000);
+-	vok = vok && kugo_pmic_read(KUGO_APC0_PPID, 0x41, &v1) && v1 == vset;
+-	printf("KUGO CPU: VDD_APC0 %u -> %u mV %s\n", 80 + 5 * v0, 80 + 5 * v1, vok ? "ok" : "FAILED");
++	vok = vok && kugo_pmic_read(c->apc_ppid, 0x41, &v1) && v1 == vset;
++	printf("KUGO CPU: %s rail %u -> %u mV %s
++", c->name, 80 + 5 * v0, 80 + 5 * v1, vok ? "ok" : "FAILED");
+ 	if (!vok) {
+-		(void)kugo_pmic_write(KUGO_APC0_PPID, 0x41, v0);
++		(void)kugo_pmic_write(c->apc_ppid, 0x41, v0);
+ 		return false;
+ 	}
+-	vm_offset_t pll = ml_io_map(0x0b116000, 0x1000), mux = ml_io_map(0x0b111000, 0x1000);
++	vm_offset_t pll = ml_io_map(c->pll_pa, 0x1000), mux = ml_io_map(c->mux_pa, 0x1000);
+ 	if (pll == 0 || mux == 0) {
+ 		return false;
+ 	}
+-	wr(pll, 0x00, 0);                       /* off, in case LK left it running */
+-	wr(pll, 0x20, 0x200d4828);              /* CONFIG_CTL_LO */
+-	wr(pll, 0x24, 0x00000006);              /* CONFIG_CTL_HI */
+-	wr(pll, 0x30, 0x1c000000);              /* TEST_CTL_LO */
+-	wr(pll, 0x34, 0x00004000);              /* TEST_CTL_HI */
+-	wr(pll, 0x18, 0x00000109);              /* USER_CTL: post div, early and main outputs */
+-	wr(pll, 0x08, l);
++	wr(pll, 0x00, 0);                       /* off (the mux is on GPLL0) */
++	wr(pll, 0x14, c->config);
++	wr(pll, 0x08, 0);                       /* M */
++	wr(pll, 0x0c, 1);                       /* N */
++	wr(pll, 0x10, c->user);
++	wr(pll, 0x04, l);
+ 	wr(pll, 0x00, 0x2);                     /* BYPASSNL */
+ 	delay(10);
+ 	wr(pll, 0x00, 0x6);                     /* | RESET_N */
+ 	bool locked = false;
+-	for (int i = 0; i < 1000 && !(locked = (rd(pll, 0x00) & (1u << 31)) != 0); i++) {
++	for (int i = 0; i < 1000 && !(locked = (rd(pll, 0x1c) & (1u << 16)) != 0); i++) {
+ 		delay(10);
+ 	}
+ 	if (!locked) {
+-		printf("KUGO CPU: A53 PLL L %u did not lock (mode %#x), A53s stay at 800 MHz\n", l, rd(pll, 0x00));
++		printf("KUGO CPU: %s PLL L %u did not lock (mode %#x status %#x), left at 800 MHz
++", c->name, l,
++		    rd(pll, 0x00), rd(pll, 0x1c));
+ 		wr(pll, 0x00, 0);
+-		(void)kugo_pmic_write(KUGO_APC0_PPID, 0x41, v0);
++		(void)kugo_pmic_write(c->apc_ppid, 0x41, v0);
+ 		return false;
+ 	}
+ 	wr(pll, 0x00, 0x7);                     /* | OUTCTRL */
+@@ -2728,11 +2736,22 @@ kugo_a53_boost(void)
+ 	while ((rd(mux, 0x50) & 1) && i++ < 1000) {
+ 		delay(1);
+ 	}
+-	printf("KUGO CPU: A53 PLL locked at L %u (%u.%u MHz), mux %#x -> %#x%s\n", l, l * 192 / 10, l * 192 % 10,
+-	    old, rd(mux, 0x54), (rd(mux, 0x50) & 1) ? ", update stuck" : "");
++	printf("KUGO CPU: %s PLL locked at L %u (%u.%u MHz), mux %#x -> %#x%s
++", c->name, l, l * 192 / 10,
++	    l * 192 % 10, old, rd(mux, 0x54), (rd(mux, 0x50) & 1) ? ", update stuck" : "");
+ 	return true;
+ }
+ 
++void kugo_cpu_boost(void);
++
++void
++kugo_cpu_boost(void)
++{
++	for (int i = 0; i < 2; i++) {
++		(void)kugo_cluster_boost(&kugo_clusters[i]);
++	}
++}
++
+ static void
+ kugo_dump(vm_offset_t g, const char *when)
+ {
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 563c401..40c56e5 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -35,6 +35,7 @@
+ #include <sys/ubc_internal.h>
+ #include <sys/vnode.h>
+ #include <security/mac_policy.h>
++#include <pexpert/pexpert.h>
+ 
+ /* iokit/Kernel/arm/SweetEntitlements.cpp */
+ void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
+@@ -329,8 +330,46 @@ sweet_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
+ 	return copyout(&flags, (user_addr_t)a[1], sizeof(flags));
+ }
+ 
++/*
++ * sweetnoexec=NAME,NAME,...: refuse to exec binaries with these file names (EPERM). Daemons for hardware
++ * this phone lacks spin otherwise: kugo's visual voicemail daemon vmd took 90% of a CPU without a modem.
++ * launchd sees the job fail and throttles its respawns. The first 8 refusals are logged.
++ */
++static char sweet_noexec[256];
++static int sweet_noexec_logged;
++
++static int
++sweet_amfi_vnode_check_exec(__unused kauth_cred_t cred, struct vnode *vp, __unused struct vnode *scriptvp,
++    __unused struct label *vnodelabel, __unused struct label *scriptlabel, __unused struct label *execlabel,
++    __unused struct componentname *cnp, __unused u_int *csflags, __unused void *macpolicyattr,
++    __unused size_t macpolicyattrlen)
++{
++	if (sweet_noexec[0] == '\0') {
++		return 0;
++	}
++	const char *name = vnode_getname(vp);
++	int error = 0;
++	if (name != NULL) {
++		size_t len = strlen(name);
++		for (const char *s = sweet_noexec; *s != '\0' && error == 0;) {
++			const char *e = strchr(s, ',');
++			size_t n = e != NULL ? (size_t)(e - s) : strlen(s);
++			if (n == len && strncmp(s, name, n) == 0) {
++				error = EPERM;
++			}
++			s += n + (e != NULL);
++		}
++		if (error && sweet_noexec_logged++ < 8) {
++			printf("SWEET AMFI: exec of %s refused (sweetnoexec)\n", name);
++		}
++		vnode_putname(name);
++	}
++	return error;
++}
++
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+ 	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
++	.mpo_vnode_check_exec = sweet_amfi_vnode_check_exec,
+ 	.mpo_policy_syscall = sweet_amfi_syscall,
+ };
+ 
+@@ -398,6 +437,7 @@ void sweet_amfi_policy_register(void);
+ void
+ sweet_amfi_policy_register(void)
+ {
++	(void)PE_parse_boot_arg_str("sweetnoexec", sweet_noexec, sizeof(sweet_noexec));
+ 	int error = mac_policy_register(&sweet_amfi_mac_conf, &sweet_amfi_mac_handle, NULL);
+ 	printf("SWEET AMFI: platform binary policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index f84d335..d166113 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -13,7 +13,7 @@
+ #if defined(KUGO)
+ extern "C" void kugo_reset_start(void);
+ extern "C" void kugo_plog_smp_on(void);
+-extern "C" bool kugo_a53_boost(void);   /* sweet_gpu.c */
++extern "C" void kugo_cpu_boost(void);   /* sweet_gpu.c */
+ #endif
+ #include <IOKit/IOCPU.h>
+ #include <IOKit/IOLib.h>
+@@ -424,7 +424,7 @@ SweetCPU::finishStart(const ml_topology_info_t *topology)
+ 	 * cluster runs on XO up to here and gets GPLL0 once its CPU is in.
+ 	 */
+ 	kugo_cpu_clocks(true);
+-	(void)kugo_a53_boost();         /* kugoa53=MHZ */
++	kugo_cpu_boost();               /* kugoa53= / kugoa72= MHZ */
+ 	kugo_reset_start();
+ #endif
+ }
