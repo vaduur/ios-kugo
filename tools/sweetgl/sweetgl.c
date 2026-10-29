@@ -86,6 +86,15 @@ sweet_drm_log(const char *fmt, ...)
 	(void)write(fd, line, n);
 }
 
+/* Mesa 25.3 st_api_create_context asks unconditionally (backboardd jumped to 0 without it, ios8-gl1) */
+static int
+frontend_get_param(struct pipe_frontend_screen *fs, enum st_manager_param param)
+{
+	(void)fs;
+	(void)param;
+	return 0;
+}
+
 bool
 sweetgl_init(void)
 {
@@ -115,6 +124,7 @@ sweetgl_init(void)
 			} else {
 				fscreen = calloc(1, sizeof(*fscreen));
 				fscreen->screen = screen;
+				fscreen->get_param = frontend_get_param;
 				sweetgl_image_hooks(fscreen);  /* before any context: st checks them at creation */
 				sweet_drm_log("sweetgl: screen %s (%s)", screen->get_name(screen),
 				    screen->get_vendor(screen));
