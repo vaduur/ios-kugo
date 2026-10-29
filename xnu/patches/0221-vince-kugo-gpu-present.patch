@@ -1,0 +1,707 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 3bc0fea..ed41fd7 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -137,18 +137,21 @@ void sweet_gpu_init(void);
+  * VINCE.h claims __ARM_COHERENT_IO__ (as Apple SoCs), which turns flush_dcache64 into a bare DSB, but
+  * the MSM8976 GPU does not snoop the CPU caches: the CP fetched zeros for a ring the CPU had just
+  * written (ROQ all zeros, gpu-dbg1) while the ucode, written before XNU, loaded fine. So clean and
+- * invalidate to the point of coherency by hand, a line at a time.
++ * invalidate to the point of coherency by hand, a line at a time (phystokv once per page).
+  */
+ void kugo_flush_dcache64(addr64_t addr, unsigned len, boolean_t phys);      /* SweetGPU.cpp too */
+ 
+ void
+ kugo_flush_dcache64(addr64_t addr, unsigned len, boolean_t phys)
+ {
+-	addr64_t end = addr + len;
++	addr64_t a = addr & ~63ull, end = addr + len;
+ 	__asm__ volatile ("dsb sy" : : : "memory");
+-	for (addr64_t a = addr & ~63ull; a < end; a += 64) {
++	while (a < end) {
++		addr64_t page_end = (a & ~(addr64_t)PAGE_MASK) + PAGE_SIZE, stop = page_end < end ? page_end : end;
+ 		uint64_t va = phys ? (uint64_t)phystokv(a & ~(addr64_t)PAGE_MASK) + (a & PAGE_MASK) : a;
+-		__asm__ volatile ("dc civac, %0" : : "r"(va) : "memory");
++		for (; a < stop; a += 64, va += 64) {
++			__asm__ volatile ("dc civac, %0" : : "r"(va) : "memory");
++		}
+ 	}
+ 	__asm__ volatile ("dsb sy" : : : "memory");
+ }
+@@ -1169,16 +1172,30 @@ vm_range(uint64_t va, uint64_t len)
+ 	return len <= end - va ? (int)m : -1;
+ }
+ 
+-/* VM lock held: clean + invalidate the CPU cache over [va, va + len) of mapping m. */
++extern boolean_t pmap_is_modified(ppnum_t pn);
++extern void pmap_clear_modify(ppnum_t pn);
++
++/*
++ * VM lock held: clean + invalidate the CPU cache over [va, va + len) of mapping m; written_only: just the
++ * pages a user mapping wrote since the last such flush (SWEET_GPU_QUAD_GPUBUF, SweetGPU.cpp's submits).
++ */
+ static void
+-vm_cache(uint32_t m, uint64_t va, uint64_t len)
++vm_cache(uint32_t m, uint64_t va, uint64_t len, bool written_only)
+ {
+ 	uint64_t off = va - g_maps[m].va;
+ 	for (uint64_t p = off / PAGE_SIZE; p <= (off + len - 1) / PAGE_SIZE; p++) {
++		ppnum_t pn = (ppnum_t)atop(g_maps[m].pa[p]);
+ 		/* not kernel RAM (the panel buffers): no physmap alias, nothing cached */
+-		if (pmap_valid_page((ppnum_t)atop(g_maps[m].pa[p]))) {
+-			flush_dcache64((addr64_t)g_maps[m].pa[p], PAGE_SIZE, TRUE);
++		if (!pmap_valid_page(pn)) {
++			continue;
+ 		}
++		if (written_only) {
++			if (!pmap_is_modified(pn)) {
++				continue;
++			}
++			pmap_clear_modify(pn);
++		}
++		flush_dcache64((addr64_t)g_maps[m].pa[p], PAGE_SIZE, TRUE);
+ 	}
+ }
+ 
+@@ -1676,7 +1693,7 @@ sweet_gpu_quad(const struct sweet_gpu_quad *q)
+ 	    q->dst_pitch < q->dst_w * 4 ||
+ 	    (q->src_va & 63) || (q->dst_va & 63) || q->w == 0 || q->h == 0 ||
+ 	    q->x0 >= q->dst_w || q->y0 >= q->dst_h || q->w > q->dst_w - q->x0 || q->h > q->dst_h - q->y0 ||
+-	    (q->flags & ~7u) || (q->flags & 6u) == 6u) {
++	    (q->flags & ~15u) || (q->flags & 6u) == 6u) {
+ 		return EINVAL;
+ 	}
+ 	uint64_t slen = (uint64_t)q->src_pitch * q->src_h, dlen = (uint64_t)q->dst_pitch * q->dst_h;
+@@ -1695,8 +1712,9 @@ sweet_gpu_quad(const struct sweet_gpu_quad *q)
+ 	}
+ 	/* the dst rows the quad reads and writes */
+ 	uint64_t drow = q->dst_va + (uint64_t)q->y0 * q->dst_pitch, drows = (uint64_t)q->h * q->dst_pitch;
+-	vm_cache((uint32_t)sf, q->src_va, slen);
+-	vm_cache((uint32_t)df, drow, drows);
++	bool gpubuf = (q->flags & SWEET_GPU_QUAD_GPUBUF) != 0;
++	vm_cache((uint32_t)sf, q->src_va, slen, gpubuf);
++	vm_cache((uint32_t)df, drow, drows, gpubuf);
+ 	/* sample4.asm: 4 pixels per invocation from xa = x0 rounded down to 4 */
+ 	uint32_t xa = q->x0 & ~3u, groups = (q->x0 + q->w - xa + 3) / 4;
+ 	uint32_t consts[48] = {
+@@ -1751,8 +1769,8 @@ sweet_gpu_quad(const struct sweet_gpu_quad *q)
+ 	}
+ 	lck_mtx_lock(&sweet_gpu_vm_lock);
+ 	df = vm_range(q->dst_va, dlen);
+-	if (df >= 0) {
+-		vm_cache((uint32_t)df, drow, drows);
++	if (df >= 0 && !gpubuf) {
++		vm_cache((uint32_t)df, drow, drows, false);
+ 	}
+ 	if (!done) {
+ 		g_ready = false;        /* hung: no recovery yet, fail fast from now on */
+@@ -2006,9 +2024,12 @@ gfx_raise(int mhz)
+ }
+ 
+ 
+-/* Full-screen (750x1334, pitch 3072) source-over quads: average us of 5. */
++/*
++ * Full-screen (750x1334, pitch 3072) source-over quads: average us of 5. flags SWEET_GPU_QUAD_GPUBUF: no
++ * cache maintenance over the 8 MB (the kernel-written images are left as the first runs flushed them).
++ */
+ static uint64_t
+-quad_bench(void)
++quad_bench(uint32_t flags)
+ {
+ 	static vm_offset_t va[2];
+ 	static uint64_t gva[2];
+@@ -2037,6 +2058,7 @@ quad_bench(void)
+ 		.w = 750, .h = h,
+ 		.m = {0x3f800000u, 0, 0, 0x3f800000u, 0, 0},
+ 		.color = {0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3f800000u}, .src_swiz = SWIZ_XYZW,
++		.flags = flags,
+ 	};
+ 	uint64_t t0 = mach_absolute_time();
+ 	for (int i = 0; i < 5; i++) {
+@@ -2047,6 +2069,79 @@ quad_bench(void)
+ 	return usecs(mach_absolute_time() - t0) / 5;
+ }
+ 
++#if defined(KUGO)
++extern boolean_t ml_set_interrupts_enabled(boolean_t enable);
++extern int cpu_number(void);
++
++/* One debug-mux count against 0x800 XO/4 ticks (427 us). */
++static uint32_t
++dbg_count(vm_offset_t g)
++{
++	wr(g, 0x74004, 0x800);
++	for (int i = 0; i < 1000000 && (rd(g, 0x74008) & (1u << 25)); i++) {
++	}
++	wr(g, 0x74004, (1u << 20) | 0x800);
++	for (int i = 0; i < 10000000 && !(rd(g, 0x74008) & (1u << 25)); i++) {
++	}
++	return rd(g, 0x74008) & 0x1ffffffu;
++}
++
++/*
++ * Read-only clock survey through the GCC debug mux (downstream clock-gcc-8916.c / -8976.c:
++ * GCC_DEBUG_CLK_CTL 0x74000 select [8:0] + enable bit 16, CLOCK_FRQ_MEASURE_CTL/STATUS 0x74004/8 counting
++ * against XO/4 from XO_DIV4_CBCR 0x30034, PLLTEST_PAD_CFG 0x7400c): every selector that runs, "sel:MHz",
++ * to read the DDR (bimc) and gfx3d rates off; then this CPU's cycle counter over 2 ms. The debug registers
++ * are restored.
++ */
++static void
++kugo_clocks(const char *when)
++{
++	vm_offset_t g = mmcc;
++	if (g == 0) {
++		return;
++	}
++	uint32_t ctl = rd(g, 0x74000), pad = rd(g, 0x7400c), cbcr = rd(g, 0x30034);
++	wr(g, 0x7400c, 0x51a00);
++	wr(g, 0x30034, cbcr | 1u);
++	char line[200];
++	int n = 0;
++	for (uint32_t sel = 0; sel < 0x200; sel++) {
++		wr(g, 0x74000, sel | (1u << 16));
++		uint32_t c = dbg_count(g);
++		if (c < 5) {
++			continue;
++		}
++		n += snprintf(line + n, sizeof(line) - (size_t)n, " %x:%u", sel, (uint32_t)((uint64_t)c * 4800 / 0x800 / 1000));
++		if (n > 150) {
++			printf("SWEET GPU: clocks %s:%s\n", when, line);
++			n = 0;
++		}
++	}
++	if (n > 0) {
++		printf("SWEET GPU: clocks %s:%s\n", when, line);
++	}
++	wr(g, 0x74000, ctl);
++	wr(g, 0x7400c, pad);
++	wr(g, 0x30034, cbcr);
++
++	uint64_t pmcr, c0, c1, t0, t1;
++	__asm__ volatile ("mrs %0, PMCR_EL0" : "=r"(pmcr));
++	__asm__ volatile ("msr PMCR_EL0, %0" : : "r"(pmcr | 1ull));
++	__asm__ volatile ("msr PMCCFILTR_EL0, %0" : : "r"(0ull));
++	__asm__ volatile ("msr PMCNTENSET_EL0, %0" : : "r"(1ull << 31));
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++	int cpu = cpu_number();
++	t0 = mach_absolute_time();
++	__asm__ volatile ("isb; mrs %0, PMCCNTR_EL0" : "=r"(c0));
++	do {
++		t1 = mach_absolute_time();
++	} while (usecs(t1 - t0) < 2000);
++	__asm__ volatile ("isb; mrs %0, PMCCNTR_EL0" : "=r"(c1));
++	ml_set_interrupts_enabled(istate);
++	printf("SWEET GPU: CPU %d runs at %llu MHz (cycle counter, PMCR %llx)\n", cpu, (c1 - c0) / usecs(t1 - t0), pmcr);
++}
++#endif
++
+ /* sweet_gpu_quad once, on scattered kernel buffers (sample_test A through the API). */
+ static void
+ api_selftest(void)
+@@ -2433,13 +2528,22 @@ cp_test(vm_offset_t gpu, int level)
+ 			int mhz = 300;
+ 			(void)PE_parse_boot_argn("sweetgpuclk", &mhz, sizeof(mhz));
+ 			g_max_mhz = 300;
+-			uint64_t us300 = quad_bench();
++			uint64_t us300 = quad_bench(0);
++#if defined(KUGO)
++			printf("SWEET GPU: full-screen quad at 300 MHz without cache maintenance: %llu us\n",
++			    quad_bench(SWEET_GPU_QUAD_GPUBUF));
++			kugo_clocks("at 300 MHz");
++#endif
+ 			if (mhz == 320 || mhz == 400 || mhz == 600) {     /* 320: kugo only */
+ 				lck_mtx_lock(&sweet_gpu_vm_lock);
+ 				bool ok = gfx_raise(mhz);
+ 				lck_mtx_unlock(&sweet_gpu_vm_lock);
+ 				g_max_mhz = ok ? mhz : 300;
+-				uint64_t usx = ok ? quad_bench() : 0;
++				uint64_t usx = ok ? quad_bench(0) : 0;
++#if defined(KUGO)
++				printf("SWEET GPU: full-screen quad at %d MHz without cache maintenance: %llu us\n", mhz,
++				    ok ? quad_bench(SWEET_GPU_QUAD_GPUBUF) : 0);
++#endif
+ 				printf("SWEET GPU: full-screen quad %llu us at 300 MHz, %llu us at %d MHz (%s)\n",
+ 				    us300, usx, mhz, !ok ? "switch FAILED" : mhz == 600 ? "S2 1015 mV, MX turbo, GPLL0/1" :
+ 				    "S2 825 mV, GPLL0/1.5");
+diff --git a/bsd/dev/sweet_gpu.h b/bsd/dev/sweet_gpu.h
+index 74eeae6..572ad51 100644
+--- a/bsd/dev/sweet_gpu.h
++++ b/bsd/dev/sweet_gpu.h
+@@ -48,6 +48,12 @@ struct sweet_gpu_quad {
+ #define SWEET_GPU_QUAD_NEAREST  1u
+ #define SWEET_GPU_QUAD_ADD      2u
+ #define SWEET_GPU_QUAD_COPY     4u
++/*
++ * src and dst only written by the GPU or through user mappings (IOSurfaces, the panel): instead of
++ * cleaning the CPU cache over both whole images around the quad, flush just the pages the pmap marks
++ * modified (kernel physmap writes are not seen), and nothing after it.
++ */
++#define SWEET_GPU_QUAD_GPUBUF   8u
+ 
+ /* True once the GPU is up (sweetgpu=8) and accepts work. */
+ bool sweet_gpu_ready(void);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 55de18d..9b5b398 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -52,8 +52,11 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <kern/thread_call.h>
+ #include <sys/proc.h>
+ #if defined(KUGO)
++#include "../../../bsd/dev/sweet_gpu.h"
+ /* sweet_gpu.c: clean+invalidate to the point of coherency (the kernel's flush_dcache64 is a bare DSB here) */
+ extern "C" void kugo_flush_dcache64(addr64_t addr, unsigned len, boolean_t phys);
++extern "C" void pmap_clear_modify(ppnum_t pn);
++extern "C" boolean_t pmap_valid_page(ppnum_t pn);
+ #endif
+ 
+ enum {
+@@ -158,8 +161,25 @@ public:
+ 	thread_call_t fPresentCall;
+ 	uint8_t       fShow[SWEET_FB_SWAP_REC_SIZE];
+ 	bool          fShowPending;
+-	uint64_t      fTimeCopy, fTimePack, fTimeKick, fTimeFrames;
++	uint64_t      fTimeCopy, fTimePack, fTimeKick, fTimeFrames, fTimeGpuFrames;
+ 	static void presentCall(thread_call_param_t p0, thread_call_param_t p1);
++	void countFrame(void);
++	/*
++	 * GPU present (kugofbgpu=0 turns it off): the GPU scales each layer straight into the 32-bpp frame at
++	 * KUGO_FB32_PHYS, which the MDP then scans out; the CPU touches no pixels. Layer surfaces stay mapped
++	 * in the GPU (retained) while CA cycles through them, the least recently shown one is dropped.
++	 */
++	bool          fGpuPresent;
++	bool          fRgb32;           /* the MDP scans out KUGO_FB32_PHYS */
++	uint32_t      fGpuErrors;
++	uint64_t      fFb32Gva;
++	uint64_t      fGpuUse;
++	struct {
++		SweetSurface *s;
++		uint64_t      gva, used;
++	} fGpuMaps[4];
++	uint64_t gpuMap(SweetSurface *s);
++	bool presentGPU(const uint8_t *rec);
+ #endif
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -304,6 +324,9 @@ AppleCLCD::start(IOService *provider)
+ 		return false;
+ 	}
+ 	hz = 60;        /* off the vsync timer: as often as a frame takes */
++	int gpu = 1;
++	PE_parse_boot_argn("kugofbgpu", &gpu, sizeof(gpu));
++	fGpuPresent = gpu != 0 && fScaled && fPanelBpp == 3;
+ #endif
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+@@ -471,6 +494,264 @@ sweet_fb_us(uint64_t abs)
+ 	absolutetime_to_nanoseconds(abs, &ns);
+ 	return ns / 1000;
+ }
++
++void
++AppleCLCD::countFrame(void)
++{
++	if ((++fTimeFrames & 63) == 0) {
++		printf("SWEET FB: 64 frames (%llu by the GPU): copy %llu us, pack %llu us, kick %llu us per frame\n",
++		    fTimeGpuFrames, sweet_fb_us(fTimeCopy) / 64, sweet_fb_us(fTimePack) / 64, sweet_fb_us(fTimeKick) / 64);
++		fTimeCopy = fTimePack = fTimeKick = fTimeGpuFrames = 0;
++	}
++}
++
++extern "C" bool kugo_panel_rgb32(uint64_t pa, uint32_t stride);
++extern "C" void kugo_panel_kick(void);
++
++/* num / den as float bits (the kernel has no FP), rounded to nearest. */
++static uint32_t
++sweet_f32(int64_t num, int64_t den)
++{
++	if (num == 0 || den <= 0) {
++		return 0;
++	}
++	uint32_t sign = num < 0 ? 0x80000000u : 0;
++	uint64_t n = (uint64_t)(num < 0 ? -num : num), d = (uint64_t)den;
++	int e = 0;
++	while (n / d >= (1ull << 24)) {
++		d <<= 1;
++		e++;
++	}
++	while (n / d < (1ull << 23)) {
++		n <<= 1;
++		e--;
++	}
++	uint64_t m = (n + d / 2) / d;
++	if (m == (1ull << 24)) {
++		m >>= 1;
++		e++;
++	}
++	return sign | (uint32_t)(e + 23 + 127) << 23 | (uint32_t)(m & 0x7fffff);
++}
++
++/*
++ * GPU VA of all of s's pixels, mapped read-only once and kept (s retained) for later frames; the least
++ * recently used of the four slots goes. A new mapping drops every CPU cache line over the surface first
++ * (the kernel's zero-fill may still sit dirty in the cache); after that the quads flush only pages a user
++ * mapping wrote (SWEET_GPU_QUAD_GPUBUF). 0 if it cannot be mapped.
++ */
++uint64_t
++AppleCLCD::gpuMap(SweetSurface *s)
++{
++	unsigned victim = 0;
++	for (unsigned i = 0; i < sizeof(fGpuMaps) / sizeof(fGpuMaps[0]); i++) {
++		if (fGpuMaps[i].s == s) {
++			fGpuMaps[i].used = ++fGpuUse;
++			return fGpuMaps[i].gva;
++		}
++		if (fGpuMaps[i].used < fGpuMaps[victim].used) {
++			victim = i;
++		}
++	}
++	IOMemoryDescriptor *md = s->memory;
++	uint64_t size = md != NULL ? md->getLength() : 0;
++	if (size == 0 || (size & PAGE_MASK) || size > (64ull << 20)) {
++		return 0;
++	}
++	if (fGpuMaps[victim].s != NULL) {
++		sweet_gpu_vm_unmap(fGpuMaps[victim].gva);
++		fGpuMaps[victim].s->memory->complete();
++		fGpuMaps[victim].s->release();
++		fGpuMaps[victim].s = NULL;
++		fGpuMaps[victim].gva = fGpuMaps[victim].used = 0;
++	}
++	if (md->prepare(kIODirectionOut) != kIOReturnSuccess) {
++		return 0;
++	}
++	uint32_t npages = (uint32_t)(size / PAGE_SIZE);
++	uint64_t *pa = (uint64_t *)IOMallocData(npages * sizeof(uint64_t));
++	bool ok = pa != NULL;
++	for (uint32_t p = 0; ok && p < npages; p++) {
++		IOByteCount seg = 0;
++		pa[p] = md->getPhysicalSegment((IOByteCount)p * PAGE_SIZE, &seg, kIOMemoryMapperNone);
++		ok = pa[p] != 0 && (pa[p] & PAGE_MASK) == 0 && seg >= PAGE_SIZE;
++		if (ok && pmap_valid_page((ppnum_t)(pa[p] >> PAGE_SHIFT))) {
++			pmap_clear_modify((ppnum_t)(pa[p] >> PAGE_SHIFT));
++			kugo_flush_dcache64((addr64_t)pa[p], PAGE_SIZE, TRUE);
++		}
++	}
++	uint64_t gva = ok ? sweet_gpu_vm_map(pa, npages, true) : 0;
++	if (pa != NULL) {
++		IOFreeData(pa, npages * sizeof(uint64_t));
++	}
++	if (gva == 0) {
++		md->complete();
++		return 0;
++	}
++	s->retain();
++	fGpuMaps[victim].s = s;
++	fGpuMaps[victim].gva = gva;
++	fGpuMaps[victim].used = ++fGpuUse;
++	return gva;
++}
++
++/*
++ * Each enabled layer as one quad, logical display -> panel (fShadowW x fShadowH -> fOutW x fHeight at
++ * column fBarX), bilinear; the first one copies, the rest blend source-over. Then the MDP is switched to
++ * the 32-bpp frame (once) and kicked. False (nothing shown) if a layer cannot go through the GPU: the CPU
++ * path takes the frame.
++ */
++bool
++AppleCLCD::presentGPU(const uint8_t *rec)
++{
++	if (!fGpuPresent || !sweet_gpu_ready()) {
++		return false;
++	}
++	uint64_t t0 = mach_absolute_time();
++	if (fFb32Gva == 0) {
++		uint32_t fbBytes = (uint32_t)round_page((uint64_t)KUGO_FB32_STRIDE * fHeight), npages = fbBytes / PAGE_SIZE;
++		IOMemoryDescriptor *pm = IOMemoryDescriptor::withPhysicalAddress(KUGO_FB32_PHYS, fbBytes, kIODirectionInOut);
++		IOMemoryMap *map = pm != NULL ? pm->map(kIOMapWriteCombineCache) : NULL;
++		if (map != NULL) {
++			volatile uint64_t *p = (volatile uint64_t *)map->getVirtualAddress();
++			for (uint32_t i = 0; i < fbBytes / 8; i++) {
++				p[i] = 0;
++			}
++			__asm__ volatile ("dsb sy" ::: "memory");
++			map->release();
++		}
++		OSSafeReleaseNULL(pm);
++		uint64_t *pa = (uint64_t *)IOMallocData(npages * sizeof(uint64_t));
++		if (pa != NULL) {
++			for (uint32_t p = 0; p < npages; p++) {
++				pa[p] = KUGO_FB32_PHYS + (uint64_t)p * PAGE_SIZE;
++			}
++			fFb32Gva = sweet_gpu_vm_map(pa, npages, false);
++			IOFreeData(pa, npages * sizeof(uint64_t));
++		}
++		IOLog("SWEET FB: GPU present: 32-bpp frame at 0x%x %s\n", KUGO_FB32_PHYS, fFb32Gva ? "mapped" : "NOT mapped");
++		if (fFb32Gva == 0) {
++			fGpuPresent = false;
++			return false;
++		}
++	}
++	uint32_t mask = get32(rec, 0x104);
++	bool drawn = false;
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		uint32_t id = get32(rec, 0x54 + 4 * layer);
++		const uint8_t *a = rec + 0x64 + 16 * layer;
++		const uint8_t *b = rec + 0xc4 + 16 * layer;
++		int32_t sx = (int32_t)get32(a, 0), sy = (int32_t)get32(a, 4);
++		int32_t dx = (int32_t)get32(b, 0), dy = (int32_t)get32(b, 4);
++		int32_t w = (int32_t)get32(b, 8), h = (int32_t)get32(b, 12);
++		if (!(mask & (1u << layer)) || id == 0) {
++			continue;
++		}
++		SweetSurface *s = sweet_surface_copy(id);
++		if (s == NULL || s == fSurface) {
++			OSSafeReleaseNULL(s);
++			continue;
++		}
++		/* the same clipping as the CPU copy, in logical coordinates */
++		if (w <= 0 || h <= 0) {
++			w = (int32_t)s->width;
++			h = (int32_t)s->height;
++		}
++		if (sx < 0 || sy < 0) {
++			sx = sy = 0;
++		}
++		if (dx < 0 || dy < 0) {
++			dx = dy = 0;
++		}
++		if (w > (int32_t)s->width - sx) {
++			w = (int32_t)s->width - sx;
++		}
++		if (w > (int32_t)fShadowW - dx) {
++			w = (int32_t)fShadowW - dx;
++		}
++		if (h > (int32_t)s->height - sy) {
++			h = (int32_t)s->height - sy;
++		}
++		if (h > (int32_t)fShadowH - dy) {
++			h = (int32_t)fShadowH - dy;
++		}
++		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
++		if (w <= 0 || h <= 0) {
++			s->release();
++			continue;
++		}
++		uint64_t gva = 0;
++		if (bpe == 4 && s->elementWidth == 1 && s->elementHeight == 1 && (s->bytesPerRow & 63) == 0 &&
++		    (s->offset & 63) == 0) {
++			gva = gpuMap(s);
++		}
++		if (gva == 0) {
++			if (fGpuErrors++ < 8) {
++				IOLog("SWEET FB: GPU present: surface %u (%ux%u bpr %u offset %u bpe %u) not mappable, CPU frame\n",
++				    s->id, s->width, s->height, s->bytesPerRow, s->offset, bpe);
++			}
++			s->release();
++			return false;
++		}
++		uint32_t px0 = fBarX + ((uint32_t)dx * fOutW + fShadowW / 2) / fShadowW;
++		uint32_t px1 = fBarX + ((uint32_t)(dx + w) * fOutW + fShadowW / 2) / fShadowW;
++		uint32_t py0 = ((uint32_t)dy * fHeight + fShadowH / 2) / fShadowH;
++		uint32_t py1 = ((uint32_t)(dy + h) * fHeight + fShadowH / 2) / fShadowH;
++		if (px1 <= px0 || py1 <= py0) {
++			s->release();
++			continue;
++		}
++		struct sweet_gpu_quad q = {};
++		q.src_va = gva + s->offset;
++		q.dst_va = fFb32Gva;
++		q.src_w = s->width;
++		q.src_h = s->height;
++		q.src_pitch = s->bytesPerRow;
++		q.dst_w = fWidth;
++		q.dst_h = fHeight;
++		q.dst_pitch = KUGO_FB32_STRIDE;
++		q.x0 = px0;
++		q.y0 = py0;
++		q.w = px1 - px0;
++		q.h = py1 - py0;
++		/* u = (X + .5) fShadowW / fOutW + sx - dx - fBarX fShadowW / fOutW; v likewise, no bars */
++		q.m[0] = sweet_f32(fShadowW, fOutW);
++		q.m[3] = sweet_f32(fShadowH, fHeight);
++		q.m[4] = sweet_f32((int64_t)(sx - dx) * fOutW - (int64_t)fBarX * fShadowW, fOutW);
++		q.m[5] = sweet_f32(sy - dy, 1);
++		q.flags = (drawn ? 0 : SWEET_GPU_QUAD_COPY) | SWEET_GPU_QUAD_GPUBUF;
++		q.color[0] = q.color[1] = q.color[2] = q.color[3] = 0x3f800000u;
++		q.src_fmt = SWEET_GPU_FMT_RGBA8;
++		q.src_swiz = 0x688;     /* xyzw */
++		int e = sweet_gpu_quad(&q);
++		s->release();
++		if (e != 0) {
++			IOLog("SWEET FB: GPU present: quad failed (%d), back to the CPU\n", e);
++			fGpuPresent = false;
++			return false;
++		}
++		drawn = true;
++	}
++	if (!drawn) {
++		return false;
++	}
++	if (!fRgb32) {
++		if (!kugo_panel_rgb32(KUGO_FB32_PHYS, KUGO_FB32_STRIDE)) {
++			IOLog("SWEET FB: GPU present: no MDP pipe to switch, back to the CPU\n");
++			fGpuPresent = false;
++			return false;
++		}
++		fRgb32 = true;
++		IOLog("SWEET FB: GPU present: the MDP scans out the 32-bpp frame\n");
++	}
++	uint64_t t1 = mach_absolute_time();
++	kugo_panel_kick();
++	fTimeCopy += t1 - t0;
++	fTimeKick += mach_absolute_time() - t1;
++	fTimeGpuFrames++;
++	countFrame();
++	return true;
++}
+ #endif
+ 
+ void
+@@ -491,6 +772,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 			sweet_console_muted = 1;
+ 		}
+ 	}
++#if defined(KUGO)
++	if (presentGPU(rec)) {
++		return;
++	}
++#endif
+ 
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+@@ -581,11 +867,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 	}
+ #endif
+ #if defined(KUGO)
+-	if ((++fTimeFrames & 63) == 0) {
+-		printf("SWEET FB: 64 frames: copy %llu us, pack %llu us, kick %llu us per frame\n",
+-		    sweet_fb_us(fTimeCopy) / 64, sweet_fb_us(fTimePack) / 64, sweet_fb_us(fTimeKick) / 64);
+-		fTimeCopy = fTimePack = fTimeKick = 0;
+-	}
++	countFrame();
+ #endif
+ }
+ 
+@@ -605,6 +887,11 @@ extern "C" void kugo_fbcon_handoff(void);
+ void
+ AppleCLCD::flushPanel(void)
+ {
++#if defined(KUGO)
++	if (fRgb32) {           /* a CPU frame after GPU ones: back to the 24-bpp buffer */
++		fRgb32 = !kugo_panel_rgb32(0, 0);
++	}
++#endif
+ 	if (fScaled) {
+ #if defined(KUGO)
+ 		uint64_t t0 = mach_absolute_time();
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index d0eaa9d..e344068 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -851,6 +851,80 @@ kugo_panel_kick(void)
+ 	ml_set_interrupts_enabled(istate);
+ }
+ 
++/*
++ * The source pipe LK points at the splash buffer (MDP5 SSPPs: VIG0-2, RGB0-2, DMA0-1, with their CTL_FLUSH
++ * bits) and its 24-bpp setup, for kugo_panel_rgb32(). SSPP registers: SRC0_ADDR 0x14, SRC_YSTRIDE0 0x24,
++ * SRC_FORMAT 0x30 (A/R/G/B bpc, alpha enable bit 8, cpp-1 [10:9], unpack count-1 [13:12]),
++ * SRC_UNPACK_PATTERN 0x34 (memory byte n -> element n: 0 G, 1 B, 2 R, 3 A).
++ */
++static const uint32_t kugo_sspp_off[8] = {0x5000, 0x7000, 0x9000, 0x15000, 0x17000, 0x19000, 0x25000, 0x27000};
++static const uint32_t kugo_sspp_flush[8] = {1u << 0, 1u << 1, 1u << 2, 1u << 3, 1u << 4, 1u << 5, 1u << 11, 1u << 12};
++static int kugo_sspp = -1;
++static uint32_t kugo_sspp_fmt24, kugo_sspp_unpack24;
++
++static void
++kugo_sspp_find(void)
++{
++	for (int i = 0; i < 8; i++) {
++		if (KUGO_MDSS_REG(kugo_sspp_off[i] + 0x14) == KUGO_FB_PHYS) {
++			kugo_sspp = i;
++			kugo_sspp_fmt24 = KUGO_MDSS_REG(kugo_sspp_off[i] + 0x30);
++			kugo_sspp_unpack24 = KUGO_MDSS_REG(kugo_sspp_off[i] + 0x34);
++			break;
++		}
++	}
++	kugo_plog_str("KUGO MDP pipe: ");
++	kugo_plog_hex("index", (uint32_t)kugo_sspp);
++	if (kugo_sspp >= 0) {
++		uint32_t b = kugo_sspp_off[kugo_sspp];
++		kugo_plog_hex("off", b);
++		kugo_plog_hex("size", KUGO_MDSS_REG(b + 0x00));
++		kugo_plog_hex("img", KUGO_MDSS_REG(b + 0x04));
++		kugo_plog_hex("out", KUGO_MDSS_REG(b + 0x0c));
++		kugo_plog_hex("ystride", KUGO_MDSS_REG(b + 0x24));
++		kugo_plog_hex("fmt", kugo_sspp_fmt24);
++		kugo_plog_hex("unpack", kugo_sspp_unpack24);
++		kugo_plog_hex("opmode", KUGO_MDSS_REG(b + 0x38));
++	}
++	kugo_plog_putc('\n');
++}
++
++/*
++ * AppleCLCD: scan out the 32-bpp XRGB8888 frame at pa (stride bytes), or the console's 24-bpp splash buffer
++ * again (pa 0). Takes effect with the next kick (CTL_FLUSH latches the double-buffered pipe registers at
++ * START); runs under the kick lock, so never against a frame in flight. False if LK's pipe was not found.
++ */
++bool kugo_panel_rgb32(uint64_t pa, uint32_t stride);
++
++bool
++kugo_panel_rgb32(uint64_t pa, uint32_t stride)
++{
++	if (fbcon_mdss == NULL || kugo_sspp < 0 || kugo_autorefresh) {
++		return false;
++	}
++	uint32_t b = kugo_sspp_off[kugo_sspp];
++	/* 24 bpp -> 32: cpp 4, 4 elements, element 3 alpha (not blended: alpha enable stays off) */
++	uint32_t fmt = pa ? ((kugo_sspp_fmt24 & ~(0x600u | 0x3000u | 0x100u)) | (3u << 9) | (3u << 12) | (3u << 6))
++	    : kugo_sspp_fmt24;
++	uint32_t unpack = pa ? ((kugo_sspp_unpack24 & 0xffffffu) | (3u << 24)) : kugo_sspp_unpack24;
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++	bool held = kugo_spin_lock(&kugo_kick_lock);
++	KUGO_MDSS_REG(b + 0x14) = pa ? (uint32_t)pa : KUGO_FB_PHYS;
++	KUGO_MDSS_REG(b + 0x24) = pa ? stride : KUGO_FB_STRIDE;
++	KUGO_MDSS_REG(b + 0x30) = fmt;
++	KUGO_MDSS_REG(b + 0x34) = unpack;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	KUGO_MDSS_REG(0x2018) = kugo_sspp_flush[kugo_sspp];
++	__asm__ volatile ("dsb sy" ::: "memory");
++	kugo_spin_unlock(&kugo_kick_lock, held);
++	ml_set_interrupts_enabled(istate);
++	kugo_plog_str(pa ? "KUGO MDP: 32-bpp scanout " : "KUGO MDP: 24-bpp scanout ");
++	kugo_plog_hex("fmt", fmt);
++	kugo_plog_hex("unpack", unpack);
++	kugo_plog_putc('\n');
++	return true;
++}
++
+ static void
+ kugo_panel_init(void)
+ {
+@@ -861,6 +935,7 @@ kugo_panel_init(void)
+ 		return;
+ 	}
+ 	kugo_panel_dump("at boot");
++	kugo_sspp_find();
+ 	if (PE_parse_boot_argn("kugoar", &frames, sizeof(frames)) && frames != 0) {
+ 		KUGO_MDSS_REG(KUGO_PP0 + KUGO_PP_AUTOREFRESH) = (1u << 31) | (frames & 0xffff);
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+diff --git a/pexpert/pexpert/arm64/VINCE.h b/pexpert/pexpert/arm64/VINCE.h
+index 5410d7d..de849b3 100644
+--- a/pexpert/pexpert/arm64/VINCE.h
++++ b/pexpert/pexpert/arm64/VINCE.h
+@@ -56,6 +56,12 @@
+ #define KUGO_FB_HEIGHT            1280
+ #define KUGO_FB_STRIDE            2160
+ #define KUGO_FB_BLOCKS            2               // 2 MiB L2 blocks covering it
++/*
++ * AppleCLCD's GPU present: a 32-bpp XRGB8888 frame (bytes B, G, R, X) the GPU scales the iOS frame into,
++ * 16 MiB into LK's 40 MiB splash region (0x83000000), outside XNU's RAM; the MDP pipe scans it out.
++ */
++#define KUGO_FB32_PHYS            0x84200000
++#define KUGO_FB32_STRIDE          2880
+ 
+ /*
+  * Command-mode DSI panel: nothing reaches the screen until MDP CTL0 START sends a frame. Kick after
