@@ -1,0 +1,381 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 1aa19d9..c4f75f3 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2598,42 +2598,53 @@ kugo_spmi_apid(uint16_t ppid)
+ 	return 0xffff;
+ }
+ 
+-/* PMIC arbiter v2, one byte: observer channel to read, this EE's channel to write (EXT_WRITEL). */
++/*
++ * PMIC arbiter v2, one byte: observer channel to read, this EE's channel to write (EXT_WRITEL). The GPU
++ * thread and the CPU clock code (kugo_a53_boost) both use it: one transfer at a time, channel pages
++ * mapped once.
++ */
++static LCK_GRP_DECLARE(kugo_spmi_grp, "kugo_spmi");
++static LCK_MTX_DECLARE(kugo_spmi_lock, &kugo_spmi_grp);
++static vm_offset_t kugo_spmi_ch[2][256];
++
+ static bool
+ kugo_pmic_xfer(uint16_t ppid, uint8_t addr, uint8_t *val, bool write)
+ {
++	bool ok = false;
++	lck_mtx_lock(&kugo_spmi_lock);
+ 	if (spmi_core == 0) {
+ 		spmi_core = ml_io_map(SPMI_CORE_PA, 0x1000);
+-		if (spmi_core == 0) {
+-			return false;
+-		}
+ 	}
+-	uint32_t apid = kugo_spmi_apid(ppid);
+-	if (apid == 0xffff) {
+-		return false;
+-	}
+-	vm_offset_t ch = ml_io_map((write ? SPMI_CHNLS_PA : SPMI_OBS_PA) + 0x8000u * apid, 0x1000);
+-	if (ch == 0) {
+-		return false;
+-	}
+-	if (write) {
+-		wr(ch, 0x10, *val);
++	uint32_t apid = spmi_core ? kugo_spmi_apid(ppid) : 0xffff;
++	vm_offset_t ch = 0;
++	if (apid < 256) {
++		ch = kugo_spmi_ch[write][apid];
++		if (ch == 0) {
++			ch = kugo_spmi_ch[write][apid] = ml_io_map((write ? SPMI_CHNLS_PA : SPMI_OBS_PA) + 0x8000u * apid, 0x1000);
++		}
+ 	}
+-	wr(ch, 0x00, ((write ? 0u : 1u) << 27) | ((uint32_t)addr << 4));
+-	for (int i = 0; i < 1000; i++) {
+-		uint32_t st = rd(ch, 0x08);
+-		if (st & 0x0eu) {
+-			return false;
++	if (ch != 0) {
++		if (write) {
++			wr(ch, 0x10, *val);
+ 		}
+-		if (st & 1u) {
+-			if (!write) {
+-				*val = (uint8_t)rd(ch, 0x18);
++		wr(ch, 0x00, ((write ? 0u : 1u) << 27) | ((uint32_t)addr << 4));
++		for (int i = 0; i < 1000; i++) {
++			uint32_t st = rd(ch, 0x08);
++			if (st & 0x0eu) {
++				break;
+ 			}
+-			return true;
++			if (st & 1u) {
++				if (!write) {
++					*val = (uint8_t)rd(ch, 0x18);
++				}
++				ok = true;
++				break;
++			}
++			delay(1);
+ 		}
+-		delay(1);
+ 	}
+-	return false;
++	lck_mtx_unlock(&kugo_spmi_lock);
++	return ok;
+ }
+ 
+ static bool
+@@ -2648,6 +2659,80 @@ kugo_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val)
+ 	return kugo_pmic_xfer(ppid, addr, &val, true);
+ }
+ 
++/*
++ * kugoa53=MHZ (SweetCPU's finishStart): the A53 cluster from LK's GPLL0 (800 MHz) to its own SR PLL at
++ * MHZ rounded down to 19.2 MHz steps, at most 1401.6 (L 73, the top of the DT's c0 table). The PLL is the
++ * block ios-vince runs MSM8953's A53s from at the same address (0x0b116000; mode 0, L 8, user 0x18, config
++ * 0x20/0x24, test 0x30/0x34; mux src 5), so its sequence is reused. VDD_APC0 (PM8950 S5, FTS2.5 range 0:
++ * 80 mV + 5 mV a step; LK leaves 1050 mV, fuse corner 2's ceiling) goes first to 1165 mV, the DT ceiling of
++ * fuse corner 3 (1017.6-1401.6 MHz); without CPR closed loop the ceiling is the safe value. Any failure
++ * leaves the cluster on GPLL0 (and the rail as LK had it).
++ */
++#define KUGO_APC0_PPID  0x120
++bool kugo_a53_boost(void);
++
++bool
++kugo_a53_boost(void)
++{
++	int mhz = 0;
++	if (!PE_parse_boot_argn("kugoa53", &mhz, sizeof(mhz)) || mhz <= 800) {
++		return false;
++	}
++	uint32_t l = (uint32_t)mhz * 10 / 192;
++	if (l > 73) {
++		l = 73;
++	}
++	uint8_t range = 0xff, v0 = 0, v1 = 0;
++	if (!kugo_pmic_read(KUGO_APC0_PPID, 0x40, &range) || range != 0 || !kugo_pmic_read(KUGO_APC0_PPID, 0x41, &v0)) {
++		printf("KUGO CPU: VDD_APC0 range %02x unreadable or not range 0, A53s stay at 800 MHz\n", range);
++		return false;
++	}
++	uint8_t vset = (uint8_t)((1165 - 80) / 5);
++	bool vok = kugo_pmic_write(KUGO_APC0_PPID, 0x41, vset);
++	delay(2000);
++	vok = vok && kugo_pmic_read(KUGO_APC0_PPID, 0x41, &v1) && v1 == vset;
++	printf("KUGO CPU: VDD_APC0 %u -> %u mV %s\n", 80 + 5 * v0, 80 + 5 * v1, vok ? "ok" : "FAILED");
++	if (!vok) {
++		(void)kugo_pmic_write(KUGO_APC0_PPID, 0x41, v0);
++		return false;
++	}
++	vm_offset_t pll = ml_io_map(0x0b116000, 0x1000), mux = ml_io_map(0x0b111000, 0x1000);
++	if (pll == 0 || mux == 0) {
++		return false;
++	}
++	wr(pll, 0x00, 0);                       /* off, in case LK left it running */
++	wr(pll, 0x20, 0x200d4828);              /* CONFIG_CTL_LO */
++	wr(pll, 0x24, 0x00000006);              /* CONFIG_CTL_HI */
++	wr(pll, 0x30, 0x1c000000);              /* TEST_CTL_LO */
++	wr(pll, 0x34, 0x00004000);              /* TEST_CTL_HI */
++	wr(pll, 0x18, 0x00000109);              /* USER_CTL: post div, early and main outputs */
++	wr(pll, 0x08, l);
++	wr(pll, 0x00, 0x2);                     /* BYPASSNL */
++	delay(10);
++	wr(pll, 0x00, 0x6);                     /* | RESET_N */
++	bool locked = false;
++	for (int i = 0; i < 1000 && !(locked = (rd(pll, 0x00) & (1u << 31)) != 0); i++) {
++		delay(10);
++	}
++	if (!locked) {
++		printf("KUGO CPU: A53 PLL L %u did not lock (mode %#x), A53s stay at 800 MHz\n", l, rd(pll, 0x00));
++		wr(pll, 0x00, 0);
++		(void)kugo_pmic_write(KUGO_APC0_PPID, 0x41, v0);
++		return false;
++	}
++	wr(pll, 0x00, 0x7);                     /* | OUTCTRL */
++	uint32_t old = rd(mux, 0x54);
++	wr(mux, 0x54, 0x501);                   /* src 5 (the PLL), div 1 */
++	wr(mux, 0x50, rd(mux, 0x50) | 1);       /* UPDATE */
++	int i = 0;
++	while ((rd(mux, 0x50) & 1) && i++ < 1000) {
++		delay(1);
++	}
++	printf("KUGO CPU: A53 PLL locked at L %u (%u.%u MHz), mux %#x -> %#x%s\n", l, l * 192 / 10, l * 192 % 10,
++	    old, rd(mux, 0x54), (rd(mux, 0x50) & 1) ? ", update stuck" : "");
++	return true;
++}
++
+ static void
+ kugo_dump(vm_offset_t g, const char *when)
+ {
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index eebe8fd..f84d335 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -13,6 +13,7 @@
+ #if defined(KUGO)
+ extern "C" void kugo_reset_start(void);
+ extern "C" void kugo_plog_smp_on(void);
++extern "C" bool kugo_a53_boost(void);   /* sweet_gpu.c */
+ #endif
+ #include <IOKit/IOCPU.h>
+ #include <IOKit/IOLib.h>
+@@ -423,6 +424,7 @@ SweetCPU::finishStart(const ml_topology_info_t *topology)
+ 	 * cluster runs on XO up to here and gets GPLL0 once its CPU is in.
+ 	 */
+ 	kugo_cpu_clocks(true);
++	(void)kugo_a53_boost();         /* kugoa53=MHZ */
+ 	kugo_reset_start();
+ #endif
+ }
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 246ecf9..a47ae69 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -173,7 +173,8 @@ public:
+ 	bool          fGpuPresent;
+ 	bool          fRgb32;           /* the MDP scans out KUGO_FB32_PHYS */
+ 	uint32_t      fGpuErrors;
+-	uint64_t      fFb32Gva;
++	uint64_t      fFb32Gva[2];      /* KUGO_FB32_PHYS + n KUGO_FB32_SPACING */
++	int           fBack;            /* the one the GPU draws into; the other is on (or going to) the panel */
+ 	uint64_t      fGpuUse;
+ 	bool          fShadowKernelWrites;      /* the kernel wrote the shadow (CPU frame, fade): flush it whole */
+ 	struct {
+@@ -519,6 +520,8 @@ AppleCLCD::countFrame(void)
+ 
+ extern "C" bool kugo_panel_rgb32(uint64_t pa, uint32_t stride);
+ extern "C" void kugo_panel_kick(void);
++extern "C" bool kugo_panel_idle(void);
++extern "C" bool kugo_panel_flip(uint64_t pa);
+ 
+ /* num / den as float bits (the kernel has no FP), rounded to nearest. */
+ static uint32_t
+@@ -620,9 +623,10 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 		return false;
+ 	}
+ 	uint64_t t0 = mach_absolute_time();
+-	if (fFb32Gva == 0) {
++	for (int f = 0; f < 2 && fFb32Gva[f] == 0; f++) {
++		uint64_t base = KUGO_FB32_PHYS + (uint64_t)f * KUGO_FB32_SPACING;
+ 		uint32_t fbBytes = (uint32_t)round_page((uint64_t)KUGO_FB32_STRIDE * fHeight), npages = fbBytes / PAGE_SIZE;
+-		IOMemoryDescriptor *pm = IOMemoryDescriptor::withPhysicalAddress(KUGO_FB32_PHYS, fbBytes, kIODirectionInOut);
++		IOMemoryDescriptor *pm = IOMemoryDescriptor::withPhysicalAddress(base, fbBytes, kIODirectionInOut);
+ 		IOMemoryMap *map = pm != NULL ? pm->map(kIOMapWriteCombineCache) : NULL;
+ 		if (map != NULL) {
+ 			volatile uint64_t *p = (volatile uint64_t *)map->getVirtualAddress();
+@@ -636,13 +640,13 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 		uint64_t *pa = (uint64_t *)IOMallocData(npages * sizeof(uint64_t));
+ 		if (pa != NULL) {
+ 			for (uint32_t p = 0; p < npages; p++) {
+-				pa[p] = KUGO_FB32_PHYS + (uint64_t)p * PAGE_SIZE;
++				pa[p] = base + (uint64_t)p * PAGE_SIZE;
+ 			}
+-			fFb32Gva = sweet_gpu_vm_map(pa, npages, false);
++			fFb32Gva[f] = sweet_gpu_vm_map(pa, npages, false);
+ 			IOFreeData(pa, npages * sizeof(uint64_t));
+ 		}
+-		IOLog("SWEET FB: GPU present: 32-bpp frame at 0x%x %s\n", KUGO_FB32_PHYS, fFb32Gva ? "mapped" : "NOT mapped");
+-		if (fFb32Gva == 0) {
++		IOLog("SWEET FB: GPU present: 32-bpp frame %d at 0x%llx %s\n", f, base, fFb32Gva[f] ? "mapped" : "NOT mapped");
++		if (fFb32Gva[f] == 0) {
+ 			fGpuPresent = false;
+ 			return false;
+ 		}
+@@ -722,7 +726,7 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 		}
+ 		struct sweet_gpu_quad q = {};
+ 		q.src_va = gva + s->offset;
+-		q.dst_va = fFb32Gva;
++		q.dst_va = fFb32Gva[fBack];
+ 		q.src_w = s->width;
+ 		q.src_h = s->height;
+ 		q.src_pitch = s->bytesPerRow;
+@@ -754,17 +758,23 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 	if (!drawn) {
+ 		return false;
+ 	}
++	uint64_t pa = KUGO_FB32_PHYS + (uint64_t)fBack * KUGO_FB32_SPACING;
+ 	if (!fRgb32) {
+-		if (!kugo_panel_rgb32(KUGO_FB32_PHYS, KUGO_FB32_STRIDE)) {
++		if (!kugo_panel_rgb32(pa, KUGO_FB32_STRIDE)) {
+ 			IOLog("SWEET FB: GPU present: no MDP pipe to switch, back to the CPU\n");
+ 			fGpuPresent = false;
+ 			return false;
+ 		}
+ 		fRgb32 = true;
+-		IOLog("SWEET FB: GPU present: the MDP scans out the 32-bpp frame\n");
++		IOLog("SWEET FB: GPU present: the MDP scans out the 32-bpp frames\n");
+ 	}
++	/* the previous frame is still going out to the panel (~13 ms): wait for it sleeping, then flip */
+ 	uint64_t t1 = mach_absolute_time();
+-	kugo_panel_kick();
++	for (int i = 0; i < 100 && !kugo_panel_idle(); i++) {
++		IOSleep(1);
++	}
++	(void)kugo_panel_flip(pa);
++	fBack ^= 1;
+ 	fTimeCopy += t1 - t0;
+ 	fTimeKick += mach_absolute_time() - t1;
+ 	fTimeGpuFrames++;
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index e344068..970e104 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -821,6 +821,31 @@ kugo_panel_dump(const char *why)
+ 
+ void kugo_panel_kick(void);
+ 
++/*
++ * A frame kugo_panel_flip() started and nobody has seen finish yet. Every other START (kick, flip) and the
++ * pipe reprogramming first let it finish, under the kick lock.
++ */
++static volatile uint32_t kugo_flip_inflight;
++
++/* Kick lock held, interrupts off. */
++static void
++kugo_flip_drain(void)
++{
++	if (!kugo_flip_inflight) {
++		return;
++	}
++	volatile uint32_t *status = (volatile uint32_t *)(fbcon_mdss + KUGO_MDP_INTR_STATUS);
++	for (unsigned int i = 0; i < 0x100000u && !(*status & (1u << KUGO_PP0_DONE_BIT)); i++) {
++	}
++	if (!(*status & (1u << KUGO_PP0_DONE_BIT))) {
++		kugo_kick_timeouts++;
++		if (kugo_kick_timeouts <= 3 || (kugo_kick_timeouts & 0xff) == 0) {
++			kugo_panel_dump("flip timeout");
++		}
++	}
++	kugo_flip_inflight = 0;
++}
++
+ void
+ kugo_panel_kick(void)
+ {
+@@ -834,6 +859,7 @@ kugo_panel_kick(void)
+ 		return;
+ 	}
+ 	bool held = kugo_spin_lock(&kugo_kick_lock);
++	kugo_flip_drain();
+ 	volatile uint32_t *status = (volatile uint32_t *)(fbcon_mdss + KUGO_MDP_INTR_STATUS);
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	KUGO_MDSS_REG(KUGO_MDP_INTR_CLEAR) = 1u << KUGO_PP0_DONE_BIT;
+@@ -909,6 +935,7 @@ kugo_panel_rgb32(uint64_t pa, uint32_t stride)
+ 	uint32_t unpack = pa ? ((kugo_sspp_unpack24 & 0xffffffu) | (3u << 24)) : kugo_sspp_unpack24;
+ 	boolean_t istate = ml_set_interrupts_enabled(FALSE);
+ 	bool held = kugo_spin_lock(&kugo_kick_lock);
++	kugo_flip_drain();
+ 	KUGO_MDSS_REG(b + 0x14) = pa ? (uint32_t)pa : KUGO_FB_PHYS;
+ 	KUGO_MDSS_REG(b + 0x24) = pa ? stride : KUGO_FB_STRIDE;
+ 	KUGO_MDSS_REG(b + 0x30) = fmt;
+@@ -925,6 +952,42 @@ kugo_panel_rgb32(uint64_t pa, uint32_t stride)
+ 	return true;
+ }
+ 
++/*
++ * AppleCLCD's double-buffered GPU frames: once the previous frame is out (the caller polls
++ * kugo_panel_idle() sleeping, so the wait here is short), point the 32-bpp pipe at pa and START without
++ * waiting for this one. The GPU draws the next frame into the other buffer meanwhile.
++ */
++bool kugo_panel_idle(void);
++bool kugo_panel_flip(uint64_t pa);
++
++bool
++kugo_panel_idle(void)
++{
++	return fbcon_mdss == NULL || !kugo_flip_inflight ||
++	       (*(volatile uint32_t *)(fbcon_mdss + KUGO_MDP_INTR_STATUS) & (1u << KUGO_PP0_DONE_BIT)) != 0;
++}
++
++bool
++kugo_panel_flip(uint64_t pa)
++{
++	if (fbcon_mdss == NULL || kugo_sspp < 0 || kugo_autorefresh) {
++		return false;
++	}
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++	bool held = kugo_spin_lock(&kugo_kick_lock);
++	kugo_flip_drain();
++	KUGO_MDSS_REG(kugo_sspp_off[kugo_sspp] + 0x14) = (uint32_t)pa;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	KUGO_MDSS_REG(0x2018) = kugo_sspp_flush[kugo_sspp];
++	KUGO_MDSS_REG(KUGO_MDP_INTR_CLEAR) = 1u << KUGO_PP0_DONE_BIT;
++	KUGO_MDSS_REG(KUGO_CTL0_START) = 1;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	kugo_flip_inflight = 1;
++	kugo_spin_unlock(&kugo_kick_lock, held);
++	ml_set_interrupts_enabled(istate);
++	return true;
++}
++
+ static void
+ kugo_panel_init(void)
+ {
+diff --git a/pexpert/pexpert/arm64/VINCE.h b/pexpert/pexpert/arm64/VINCE.h
+index de849b3..f822c13 100644
+--- a/pexpert/pexpert/arm64/VINCE.h
++++ b/pexpert/pexpert/arm64/VINCE.h
+@@ -62,6 +62,7 @@
+  */
+ #define KUGO_FB32_PHYS            0x84200000
+ #define KUGO_FB32_STRIDE          2880
++#define KUGO_FB32_SPACING         0x400000        // two of them (double buffering), 4 MiB apart
+ 
+ /*
+  * Command-mode DSI panel: nothing reaches the screen until MDP CTL0 START sends a frame. Kick after
