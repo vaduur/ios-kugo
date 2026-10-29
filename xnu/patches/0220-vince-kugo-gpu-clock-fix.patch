@@ -1,0 +1,21 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index cfccffa..3bc0fea 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1983,7 +1983,7 @@ gfx_raise(int mhz)
+ 	bool ok = poll(mmcc, G_GFX3D_CMD, 1u, 0, 10);
+ 	printf("SWEET GPU: gfx3d %u MHz at S5 %u mV: %s\n", mhz, mv, ok ? "ok" : "RCG update FAILED");
+ 	return ok;
+-#endif
++#else
+ 	uint8_t sub = 0, v = 0;
+ 	uint32_t mv = mhz == 600 ? 1015 : 825;
+ 	if (!sweet_pmic_read(GFX_S2, 0x05, &sub) || (sub != 8 && sub != 9)) {
+@@ -2002,6 +2002,7 @@ gfx_raise(int mhz)
+ 		return false;
+ 	}
+ 	return gfx_clock(mhz == 600 ? 1 : 2);
++#endif
+ }
+ 
+ 
