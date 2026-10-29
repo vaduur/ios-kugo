@@ -11,7 +11,8 @@ the phone's live Linux DT (/sys/firmware/fdt) and the iSony shim probes:
   below the CMA pools Linux puts at the top
 - SDHCI eMMC @ 0x07824900, hc_irq SPI 123
 - CPUs: the Cortex-A53 cluster (MPIDR 0..3); cpu0 runs, SweetCPU starts the rest with PSCI CPU_ON
-  (--cpus, default 1). The A72 pair (0x100, 0x101) is left out: LK leaves that cluster on XO.
+  (--cpus, default 1). --cpus 5 adds the first A72 (MPIDR 0x100, cluster 1): LK leaves that cluster on
+  XO, so boot with kugoa72=1 (SweetCPU moves it to GPLL0). The second A72 (0x101) fails CPU_ON (-6).
 """
 import argparse
 import hashlib
@@ -26,6 +27,7 @@ PHYS_BASE = 0x90000000
 MEM_SIZE = 0x43c00000
 
 PANIC_LOG_SIZE = 0x100000
+CPU_MPIDRS = [0, 1, 2, 3, 0x100]
 
 # Non-zero SOC base for arm-io so pe_arm_get_soc_base_phys() returns non-zero
 SOC_BASE = 0x01000000
@@ -185,16 +187,18 @@ def build_kugo_adt(seed=None, product_from=None, ncpus=1, identity='iphone8'):
 
     cpu_nodes = []
     for core in range(ncpus):
+        mpidr = CPU_MPIDRS[core]
+        model = 'cortex-a72' if mpidr >> 8 else 'cortex-a53'
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr('qcom,cortex-a53') + cstr('ARM,v8') + b'\0'),
-            ('reg', u32(core)),
+            ('compatible', cstr('qcom,' + model) + cstr('ARM,v8') + b'\0'),
+            ('reg', u32(mpidr)),
             ('cpu-id', u32(core)),
-            ('cluster-id', u32(0)),
+            ('cluster-id', u32(mpidr >> 8)),
             ('cluster-type', u32(0)),
-            ('die-cluster-id', u32(0)),
-            ('cluster-core-id', u32(core)),
+            ('die-cluster-id', u32(mpidr >> 8)),
+            ('cluster-core-id', u32(mpidr & 0xff)),
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(TIMEBASE)),
             ('clock-frequency', u32(1401600000)),
@@ -202,7 +206,7 @@ def build_kugo_adt(seed=None, product_from=None, ncpus=1, identity='iphone8'):
             ('memory-frequency', u32(933000000)),
             ('peripheral-frequency', u32(TIMEBASE)),
             ('fixed-frequency', u32(TIMEBASE)),
-            ('cpu-model', cstr('cortex-a53')),
+            ('cpu-model', cstr(model)),
         ]))
     cpus = node('cpus', [ph(), ('#address-cells', u32(1)), ('#size-cells', u32(0))], cpu_nodes)
 
@@ -250,7 +254,7 @@ def main():
     parser.add_argument('--product-from', help="the iPhone's device tree (d20ap.adt / d22ap.adt, from the IPSW) for /product")
     parser.add_argument('--identity', choices=sorted(IDENTITIES), default='iphone8',
                         help='userland identity: iphone8 (D20AP, default) or iphonex (D22AP)')
-    parser.add_argument('--cpus', type=int, default=1, choices=range(1, 5), help='A53 cores in the ADT (1-4)')
+    parser.add_argument('--cpus', type=int, default=1, choices=range(1, 6), help='cores in the ADT: 1-4 A53s, 5 adds an A72')
     args = parser.parse_args()
     data = adt.serialize(build_kugo_adt(product_from=args.product_from, ncpus=args.cpus, identity=args.identity))
     with open(args.output, 'wb') as f:

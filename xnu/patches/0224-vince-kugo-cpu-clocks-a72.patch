@@ -1,0 +1,119 @@
+diff --git a/bsd/dev/kugo_perf.c b/bsd/dev/kugo_perf.c
+index 88286f5..ee14be6 100644
+--- a/bsd/dev/kugo_perf.c
++++ b/bsd/dev/kugo_perf.c
+@@ -156,9 +156,9 @@ perf_thread(void *arg, wait_result_t result)
+ 	uint64_t swaps = 0, presents = 0, gpu = 0, t = mach_absolute_time();
+ 	for (;;) {
+ 		perf_wait(10);
+-		uint64_t mhz[4] = {0, 0, 0, 0};
++		uint64_t mhz[6] = {0, 0, 0, 0, 0, 0};
+ 		int ncpu = (int)ml_get_cpu_count();
+-		for (int c = 0; c < 4 && c < ncpu; c++) {
++		for (int c = 0; c < 6 && c < ncpu; c++) {
+ 			thread_bind(cpu_to_processor(c));
+ 			thread_block(THREAD_CONTINUE_NULL);     /* migrate */
+ 			mhz[c] = perf_mhz();
+@@ -166,8 +166,8 @@ perf_thread(void *arg, wait_result_t result)
+ 		thread_bind(NULL);
+ 		uint64_t now = mach_absolute_time(), ms = perf_ns(now - t) / NSEC_PER_MSEC;
+ 		uint64_t ds = kugo_fb_swaps - swaps, dp = kugo_fb_presents - presents, dg = kugo_fb_gpu_presents - gpu;
+-		printf("KUGO PERF: MHz %llu/%llu/%llu/%llu  swaps %llu.%llu/s  presents %llu.%llu/s (%llu by the GPU)\n",
+-		    mhz[0], mhz[1], mhz[2], mhz[3],
++		printf("KUGO PERF: MHz %llu/%llu/%llu/%llu/%llu/%llu  swaps %llu.%llu/s  presents %llu.%llu/s (%llu by the GPU)\n",
++		    mhz[0], mhz[1], mhz[2], mhz[3], mhz[4], mhz[5],
+ 		    ms ? ds * 1000 / ms : 0, ms ? ds * 10000 / ms % 10 : 0,
+ 		    ms ? dp * 1000 / ms : 0, ms ? dp * 10000 / ms % 10 : 0, dg);
+ 		perf_top(perf_ns(now - t));
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 5d94b43..1aa19d9 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2689,6 +2689,18 @@ gpu_thread(void *arg, wait_result_t result)
+ 		}
+ 		printf("SWEET GPU: VDD_MX PM8950 S6 %s type %02x subtype %02x range %02x vset %02x\n",
+ 		    mxok ? "ok" : "UNREADABLE", mx[0], mx[1], mx[2], mx[3]);
++		/* the CPU rails (DT apc0/apc1 vdd-apc-supply: spm-regulators PM8950 S5, PM8004 S2), read only */
++		static const uint16_t apc_ppid[2] = {0x120, 0x517};
++		static const uint8_t apcregs[6] = {0x04, 0x05, 0x08, 0x40, 0x41, 0x46};
++		for (int r = 0; r < 2; r++) {
++			uint8_t v[6] = {0};
++			bool ok = true;
++			for (int i = 0; i < 6; i++) {
++				ok = ok && sweet_pmic_read(apc_ppid[r], apcregs[i], &v[i]);
++			}
++			printf("SWEET GPU: VDD_APC%d ppid %03x %s type %02x subtype %02x status %02x range %02x vset %02x en %02x\n",
++			    r, apc_ppid[r], ok ? "ok" : "UNREADABLE", v[0], v[1], v[2], v[3], v[4], v[5]);
++		}
+ 	}
+ 	if (!s5ok || s5[3] != 0) {
+ 		printf("SWEET GPU: S5 unreadable or not range 0, stop\n");
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index f23e721..665611d 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -183,6 +183,54 @@ vince_cpu_clock_init(void)
+ 
+ 	IOLog("VINCE CLK: APCS PLL locked (L=%u), both clusters set to A53 PLL (0x501)\n", l_val);
+ }
++
++#if defined(KUGO)
++/*
++ * MSM8956 CPU clocks (Android DT qcom,cpu-clock-8976): the A53 cluster (c0) mux at 0x0b111050, the A72
++ * cluster (c1) at 0x0b011050, the CCI at 0x0b1d1050 (CMD +0, CFG +4: src_sel bits 8-10, 0 XO, 4 GPLL0,
++ * 5 the cluster PLL; div bits 0-4 = 2 div - 1); their PLLs at 0x0b116000 (A53 SR PLL), 0x0b016000 (A72 HF
++ * PLL), 0x0b1d0000 (CCI). Measured: the A53s run at 799 MHz, LK's GPLL0; the A72s sit on XO. The state
++ * is logged; kugoa72=1 gives the A72 cluster cluster 0's GPLL0 source (vince 0115), which needs nothing
++ * from VDD_APC1 beyond what LK left (Linux runs the A72s at 400-883 MHz on corner 1-2).
++ */
++static void
++kugo_cpu_clocks(void)
++{
++	static const uint32_t mux_pa[3] = {0x0b111000, 0x0b011000, 0x0b1d1000};
++	static const uint32_t pll_pa[3] = {0x0b116000, 0x0b016000, 0x0b1d0000};
++	static const char *const name[3] = {"A53", "A72", "CCI"};
++	volatile uint32_t *mux[3], *pll[3];
++	for (int i = 0; i < 3; i++) {
++		mux[i] = (volatile uint32_t *)(ml_io_map(mux_pa[i], 0x1000) + 0x50);
++		pll[i] = (volatile uint32_t *)ml_io_map(pll_pa[i], 0x1000);
++		if ((uintptr_t)mux[i] == 0x50 || pll[i] == NULL) {
++			IOLog("KUGO CLK: mapping failed\n");
++			return;
++		}
++		IOLog("KUGO CLK: %s mux cmd %#x cfg %#x; pll mode %#x l %#x/%#x user %#x status %#x %#x\n", name[i],
++		    mux[i][0], mux[i][1], pll[i][0], pll[i][1], pll[i][2], pll[i][6], pll[i][9], pll[i][10]);
++	}
++	int a72 = 0;
++	PE_parse_boot_argn("kugoa72", &a72, sizeof(a72));
++	uint32_t cfg0 = mux[0][1], old = mux[1][1];
++	if (!a72) {
++		return;
++	}
++	if (((old >> 8) & 7) != 0 || ((cfg0 >> 8) & 7) != 4) {
++		IOLog("KUGO CLK: A72 mux %#x, A53 mux %#x: not XO / GPLL0, left alone\n", old, cfg0);
++		return;
++	}
++	mux[1][1] = cfg0;
++	__builtin_arm_dsb(DSB_SY);
++	mux[1][0] = mux[1][0] | 1;      /* UPDATE */
++	__builtin_arm_dsb(DSB_SY);
++	int i = 0;
++	while ((mux[1][0] & 1) && i++ < 1000) {
++		IODelay(1);
++	}
++	IOLog("KUGO CLK: A72 mux %#x -> %#x (GPLL0, as the A53s)%s\n", old, mux[1][1], (mux[1][0] & 1) ? ", update stuck" : "");
++}
++#endif
+ static uint32_t gVinceBootRegistered;   /* the boot CPU finished processor_start */
+ static uint32_t gVinceStarted;
+ static uint32_t gVinceStartBusy;        /* one secondary at a time through register + start + wait */
+@@ -293,7 +341,8 @@ SweetCPU::start(IOService *provider)
+ #if defined(VINCE)
+ 	if (boot) {
+ #if defined(KUGO)
+-		/* MSM8956 clusters (A53 / A72) have their own PLLs and muxes; leave LK's clocks alone. */
++		/* MSM8956 clusters (A53 / A72) have their own PLLs and muxes: logged, the A72 one on request */
++		kugo_cpu_clocks();
+ 		vm_offset_t marks = ml_io_map(KUGO_CTL_PAGE_PHYS, 0x1000);
+ #else
+ 		vince_cpu_clock_init();
