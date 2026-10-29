@@ -1,0 +1,282 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 1e726d2..de2fca5 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@ bsd/dev/sweet_usb.c			standard
+ bsd/dev/vince_mmc.c			standard
+ bsd/dev/vince_input.c			standard
+ bsd/dev/vince_ctl.c			standard
++bsd/dev/kugo_perf.c			standard
+ bsd/dev/vince_smd.c			standard
+ bsd/dev/vince_pmic.c			standard
+ bsd/dev/vince_bt.c			standard
+diff --git a/bsd/dev/kugo_perf.c b/bsd/dev/kugo_perf.c
+new file mode 100644
+index 0000000..88286f5
+--- /dev/null
++++ b/bsd/dev/kugo_perf.c
+@@ -0,0 +1,191 @@
++/*
++ * kugo performance probe (ios-sailfish sweet_perf.c, cut down; kugoperf=0 turns it off). Every 10 s:
++ *   KUGO PERF  each CPU's clock (a chain of dependent adds, one a cycle on the A53, timed against the
++ *              19.2 MHz timer with interrupts off), framebuffer swaps (CoreAnimation frames) and presents
++ *              per second (SweetFramebuffer.cpp counts them)
++ *   KUGO TOP   the processes that used the most CPU in the interval, from the cpu_time ledger, in percent
++ *              of one CPU (400% = four CPUs busy)
++ */
++#if defined(ARM64_BOARD_CONFIG_VINCE)
++#include <pexpert/arm64/board_config.h>
++#endif
++#if defined(KUGO)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/proc_internal.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern struct processor *cpu_to_processor(int cpu);
++extern struct processor *thread_bind(struct processor *processor);
++extern uint64_t get_task_cpu_time(task_t task);
++void kugo_perf_init(void);
++
++/* SweetFramebuffer.cpp */
++uint64_t kugo_fb_swaps, kugo_fb_presents, kugo_fb_gpu_presents;
++
++static int perf_sleep_chan;
++
++static uint64_t
++perf_ns(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns;
++}
++
++/* MHz of the current CPU: 16 dependent adds per iteration, 4M cycles (2 ms at 2 GHz, 10 ms at 400 MHz). */
++static uint64_t
++perf_mhz(void)
++{
++	uint64_t n = 1u << 18, x = 0;
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++	uint64_t t0 = mach_absolute_time();
++	__asm__ volatile (
++		"1:\n"
++		".rept 16\n"
++		"add %0, %0, #1\n"
++		".endr\n"
++		"subs %1, %1, #1\n"
++		"b.ne 1b\n"
++		: "+r"(x), "+r"(n) : : "cc");
++	uint64_t ns = perf_ns(mach_absolute_time() - t0);
++	ml_set_interrupts_enabled(istate);
++	return ns ? (16ull << 18) * 1000 / ns : 0;
++}
++
++#define TOP_SLOTS 512
++static struct {
++	int pid;
++	uint32_t gen;
++	uint64_t last, delta;
++	char name[20];
++} top_tab[TOP_SLOTS];
++static uint32_t top_gen;
++
++static int
++top_visit(proc_t p, __unused void *arg)
++{
++	task_t task = proc_task(p);
++	int pid = proc_pid(p), free = -1, i;
++	if (task == TASK_NULL) {
++		return PROC_RETURNED;
++	}
++	uint64_t ns = perf_ns(get_task_cpu_time(task));
++	for (i = 0; i < TOP_SLOTS; i++) {
++		if (top_tab[i].gen != 0 && top_tab[i].pid == pid) {
++			break;
++		}
++		if (free < 0 && top_tab[i].gen + 1 < top_gen) {
++			free = i;       /* unused, or not seen last round */
++		}
++	}
++	if (i == TOP_SLOTS) {
++		if (free < 0) {
++			return PROC_RETURNED;
++		}
++		i = free;
++		top_tab[i].pid = pid;
++		top_tab[i].last = ns;
++		strlcpy(top_tab[i].name, proc_best_name(p), sizeof(top_tab[i].name));
++	}
++	top_tab[i].delta = ns >= top_tab[i].last ? ns - top_tab[i].last : 0;      /* pid reused */
++	top_tab[i].last = ns;
++	top_tab[i].gen = top_gen;
++	return PROC_RETURNED;
++}
++
++static void
++perf_top(uint64_t interval_ns)
++{
++	char line[400];
++	int n, used[8];
++	uint64_t total = 0;
++	top_gen++;
++	proc_iterate(PROC_ALLPROCLIST, top_visit, NULL, NULL, NULL);
++	for (int i = 0; i < TOP_SLOTS; i++) {
++		if (top_tab[i].gen == top_gen) {
++			total += top_tab[i].delta;
++		}
++	}
++	if (interval_ns == 0) {
++		return;
++	}
++	n = snprintf(line, sizeof(line), "KUGO TOP: all %llu%% |", total * 100 / interval_ns);
++	for (int k = 0; k < 8; k++) {
++		int best = -1;
++		for (int i = 0; i < TOP_SLOTS; i++) {
++			bool taken = false;
++			for (int j = 0; j < k; j++) {
++				taken |= used[j] == i;
++			}
++			if (!taken && top_tab[i].gen == top_gen &&
++			    (best < 0 || top_tab[i].delta > top_tab[best].delta)) {
++				best = i;
++			}
++		}
++		used[k] = best;
++		if (best < 0 || top_tab[best].delta * 100 / interval_ns == 0) {
++			break;
++		}
++		n += snprintf(line + n, sizeof(line) - (size_t)n, " %s[%d] %llu%%", top_tab[best].name,
++		    top_tab[best].pid, top_tab[best].delta * 100 / interval_ns);
++	}
++	printf("%s\n", line);
++}
++
++static void
++perf_wait(unsigned secs)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(secs, NSEC_PER_SEC, &deadline);
++	(void)assert_wait_deadline(&perf_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++perf_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	top_gen = 1;
++	perf_top(0);
++	uint64_t swaps = 0, presents = 0, gpu = 0, t = mach_absolute_time();
++	for (;;) {
++		perf_wait(10);
++		uint64_t mhz[4] = {0, 0, 0, 0};
++		int ncpu = (int)ml_get_cpu_count();
++		for (int c = 0; c < 4 && c < ncpu; c++) {
++			thread_bind(cpu_to_processor(c));
++			thread_block(THREAD_CONTINUE_NULL);     /* migrate */
++			mhz[c] = perf_mhz();
++		}
++		thread_bind(NULL);
++		uint64_t now = mach_absolute_time(), ms = perf_ns(now - t) / NSEC_PER_MSEC;
++		uint64_t ds = kugo_fb_swaps - swaps, dp = kugo_fb_presents - presents, dg = kugo_fb_gpu_presents - gpu;
++		printf("KUGO PERF: MHz %llu/%llu/%llu/%llu  swaps %llu.%llu/s  presents %llu.%llu/s (%llu by the GPU)\n",
++		    mhz[0], mhz[1], mhz[2], mhz[3],
++		    ms ? ds * 1000 / ms : 0, ms ? ds * 10000 / ms % 10 : 0,
++		    ms ? dp * 1000 / ms : 0, ms ? dp * 10000 / ms % 10 : 0, dg);
++		perf_top(perf_ns(now - t));
++		swaps = kugo_fb_swaps;
++		presents = kugo_fb_presents;
++		gpu = kugo_fb_gpu_presents;
++		t = now;
++	}
++}
++
++void
++kugo_perf_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++	(void)PE_parse_boot_argn("kugoperf", &enabled, sizeof(enabled));
++	if (enabled && kernel_thread_start(perf_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* KUGO */
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index ed41fd7..5d94b43 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2097,7 +2097,9 @@ static void
+ kugo_clocks(const char *when)
+ {
+ 	vm_offset_t g = mmcc;
+-	if (g == 0) {
++	int on = 0;
++	/* kugoclocks=1: DDR measured at 932 MHz (bimc sel 0x154 466 MHz) with LK's setup, nothing to vote */
++	if (g == 0 || !PE_parse_boot_argn("kugoclocks", &on, sizeof(on)) || !on) {
+ 		return;
+ 	}
+ 	uint32_t ctl = rd(g, 0x74000), pad = rd(g, 0x7400c), cbcr = rd(g, 0x30034);
+diff --git a/bsd/dev/vince_ctl.c b/bsd/dev/vince_ctl.c
+index de826dc..db7b7c5 100644
+--- a/bsd/dev/vince_ctl.c
++++ b/bsd/dev/vince_ctl.c
+@@ -82,6 +82,7 @@ vince_ctl_start(void)
+ 
+ void kugo_reset_now(const char *why);
+ void kugo_reset_start(void);
++void kugo_perf_init(void);       /* kugo_perf.c */
+ 
+ static int kugo_reset_chan;
+ 
+@@ -155,6 +156,7 @@ kugo_reset_start(void)
+ 	} else {
+ 		printf("KUGO: watchdog/reset thread not started\n");
+ 	}
++	kugo_perf_init();
+ }
+ #endif /* KUGO */
+ #endif /* ARM64_BOARD_CONFIG_VINCE */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 7514018..246ecf9 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -57,6 +57,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void kugo_flush_dcache64(addr64_t addr, unsigned len, boolean_t phys);
+ extern "C" void pmap_clear_modify(ppnum_t pn);
+ extern "C" boolean_t pmap_valid_page(ppnum_t pn);
++extern "C" uint64_t kugo_fb_swaps, kugo_fb_presents, kugo_fb_gpu_presents;     /* kugo_perf.c */
+ #endif
+ 
+ enum {
+@@ -466,6 +467,9 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
++#if defined(KUGO)
++	kugo_fb_swaps++;
++#endif
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+@@ -505,6 +509,7 @@ sweet_fb_us(uint64_t abs)
+ void
+ AppleCLCD::countFrame(void)
+ {
++	kugo_fb_presents++;
+ 	if ((++fTimeFrames & 63) == 0) {
+ 		printf("SWEET FB: 64 frames (%llu by the GPU): copy %llu us, pack %llu us, kick %llu us per frame\n",
+ 		    fTimeGpuFrames, sweet_fb_us(fTimeCopy) / 64, sweet_fb_us(fTimePack) / 64, sweet_fb_us(fTimeKick) / 64);
+@@ -763,6 +768,7 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 	fTimeCopy += t1 - t0;
+ 	fTimeKick += mach_absolute_time() - t1;
+ 	fTimeGpuFrames++;
++	kugo_fb_gpu_presents++;
+ 	countFrame();
+ 	return true;
+ }
