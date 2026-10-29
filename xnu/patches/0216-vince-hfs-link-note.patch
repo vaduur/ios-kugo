@@ -1,0 +1,11 @@
+--- a/bsd/sweet_hfs/core/hfs_catalog.c
++++ b/bsd/sweet_hfs/core/hfs_catalog.c
+@@ -757,7 +757,7 @@
+ }
+ 
+ 
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_VINCE)
+ /*
+  * SWEET: hard links made by Linux tools lack kHFSHasLinkChainBit and every
+  * lookup of them repairs (in memory) and reports it again; the console
