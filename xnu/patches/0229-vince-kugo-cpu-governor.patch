@@ -1,0 +1,179 @@
+diff --git a/bsd/dev/kugo_perf.c b/bsd/dev/kugo_perf.c
+index ee14be6..a2ee5df 100644
+--- a/bsd/dev/kugo_perf.c
++++ b/bsd/dev/kugo_perf.c
+@@ -26,6 +26,11 @@ void kugo_perf_init(void);
+ 
+ /* SweetFramebuffer.cpp */
+ uint64_t kugo_fb_swaps, kugo_fb_presents, kugo_fb_gpu_presents;
++/* vince_input.c: touch reports */
++uint64_t kugo_touch_events;
++/* sweet_gpu.c: boosted clusters to their PLLs at 1165 mV (true) or back to GPLL0 at LK's voltage */
++extern void kugo_cpu_set_fast(bool fast);
++static uint64_t gov_switches, gov_fast_ms;
+ 
+ static int perf_sleep_chan;
+ 
+@@ -166,10 +171,12 @@ perf_thread(void *arg, wait_result_t result)
+ 		thread_bind(NULL);
+ 		uint64_t now = mach_absolute_time(), ms = perf_ns(now - t) / NSEC_PER_MSEC;
+ 		uint64_t ds = kugo_fb_swaps - swaps, dp = kugo_fb_presents - presents, dg = kugo_fb_gpu_presents - gpu;
+-		printf("KUGO PERF: MHz %llu/%llu/%llu/%llu/%llu/%llu  swaps %llu.%llu/s  presents %llu.%llu/s (%llu by the GPU)\n",
++		printf("KUGO PERF: MHz %llu/%llu/%llu/%llu/%llu/%llu  swaps %llu.%llu/s  presents %llu.%llu/s (%llu by the GPU)"
++		    "  boosted %llu%% (%llu switches)\n",
+ 		    mhz[0], mhz[1], mhz[2], mhz[3], mhz[4], mhz[5],
+ 		    ms ? ds * 1000 / ms : 0, ms ? ds * 10000 / ms % 10 : 0,
+-		    ms ? dp * 1000 / ms : 0, ms ? dp * 10000 / ms % 10 : 0, dg);
++		    ms ? dp * 1000 / ms : 0, ms ? dp * 10000 / ms % 10 : 0, dg, ms ? gov_fast_ms * 100 / ms : 0, gov_switches);
++		gov_fast_ms = gov_switches = 0;
+ 		perf_top(perf_ns(now - t));
+ 		swaps = kugo_fb_swaps;
+ 		presents = kugo_fb_presents;
+@@ -178,14 +185,61 @@ perf_thread(void *arg, wait_result_t result)
+ 	}
+ }
+ 
++/*
++ * CPU governor (kugogov=0 turns it off and leaves boosted clusters fast): at full clock and 1165 mV with
++ * nothing but WFI when idle the phone got hot, so the clusters run boosted only while the UI is in use,
++ * a CoreAnimation swap or a touch report in the last kugogov_ms (default 1500), and at LK's 800 MHz
++ * otherwise. Checked every 20 ms; going fast takes ~0.3 ms.
++ */
++static int gov_chan;
++
++static void
++gov_thread(void *arg, wait_result_t result)
++{
++	(void)result;
++	uint64_t hold_ms = (uint64_t)(uintptr_t)arg, swaps = kugo_fb_swaps, touches = kugo_touch_events;
++	uint64_t last_active = mach_absolute_time(), last = last_active;
++	bool fast = true;               /* kugo_cpu_boost left the clusters on their PLLs */
++	for (;;) {
++		uint64_t deadline;
++		clock_interval_to_deadline(20, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&gov_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++		uint64_t now = mach_absolute_time();
++		if (fast) {
++			gov_fast_ms += perf_ns(now - last) / NSEC_PER_MSEC;
++		}
++		last = now;
++		if (kugo_fb_swaps != swaps || kugo_touch_events != touches) {
++			swaps = kugo_fb_swaps;
++			touches = kugo_touch_events;
++			last_active = now;
++			if (!fast) {
++				kugo_cpu_set_fast(true);
++				fast = true;
++				gov_switches++;
++			}
++		} else if (fast && perf_ns(now - last_active) / NSEC_PER_MSEC > hold_ms) {
++			kugo_cpu_set_fast(false);
++			fast = false;
++			gov_switches++;
++		}
++	}
++}
++
+ void
+ kugo_perf_init(void)
+ {
+-	int enabled = 1;
++	int enabled = 1, gov = 1, hold = 1500;
+ 	thread_t thread;
+ 	(void)PE_parse_boot_argn("kugoperf", &enabled, sizeof(enabled));
+ 	if (enabled && kernel_thread_start(perf_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	(void)PE_parse_boot_argn("kugogov", &gov, sizeof(gov));
++	(void)PE_parse_boot_argn("kugogov_ms", &hold, sizeof(hold));
++	if (gov && kernel_thread_start(gov_thread, (void *)(uintptr_t)hold, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ }
+ #endif /* KUGO */
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 8da4672..f04e572 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2677,6 +2677,8 @@ static const struct kugo_cluster {
+ 	{"A53", "kugoa53", 0x0b116000, 0x0b111000, 0x341600, 0x109, 47, 73, 0x120},
+ 	{"A72", "kugoa72", 0x0b016000, 0x0b011000, 0x4e0405d, 0x100109, 49, 94, 0x517},
+ };
++static vm_offset_t kugo_boost_mux[2];   /* set once a cluster runs on its PLL */
++static uint8_t kugo_boost_vlow[2];      /* LK's rail vset, for the governor's slow state */
+ 
+ static bool
+ kugo_cluster_boost(const struct kugo_cluster *c)
+@@ -2735,9 +2737,47 @@ kugo_cluster_boost(const struct kugo_cluster *c)
+ 	}
+ 	printf("KUGO CPU: %s PLL locked at L %u (%u.%u MHz), mux %#x -> %#x%s\n", c->name, l, l * 192 / 10,
+ 	    l * 192 % 10, old, rd(mux, 0x54), (rd(mux, 0x50) & 1) ? ", update stuck" : "");
++	size_t k = (size_t)(c - kugo_clusters);
++	kugo_boost_mux[k] = mux;
++	kugo_boost_vlow[k] = v0;
+ 	return true;
+ }
+ 
++/*
++ * kugo_perf.c's governor: a boosted cluster back to GPLL0 at LK's rail voltage (fast false), or onto its
++ * PLL, which keeps running, at 1165 mV (fast true). The rail goes up before the clock and down after it.
++ * Both cluster muxes switch glitch-free with the CPUs running (Linux does the same).
++ */
++void kugo_cpu_set_fast(bool fast);
++
++static void
++kugo_mux_set(vm_offset_t mux, uint32_t cfg)
++{
++	wr(mux, 0x54, cfg);
++	wr(mux, 0x50, rd(mux, 0x50) | 1);       /* UPDATE */
++	for (int i = 0; i < 1000 && (rd(mux, 0x50) & 1); i++) {
++		delay(1);
++	}
++}
++
++void
++kugo_cpu_set_fast(bool fast)
++{
++	for (int k = 0; k < 2; k++) {
++		if (kugo_boost_mux[k] == 0) {
++			continue;
++		}
++		if (fast) {
++			(void)kugo_pmic_write(kugo_clusters[k].apc_ppid, 0x41, (uint8_t)((1165 - 80) / 5));
++			delay(200);                     /* the FTS2.5 slews ~115 mV well within this */
++			kugo_mux_set(kugo_boost_mux[k], 0x501);
++		} else {
++			kugo_mux_set(kugo_boost_mux[k], 0x401);
++			(void)kugo_pmic_write(kugo_clusters[k].apc_ppid, 0x41, kugo_boost_vlow[k]);
++		}
++	}
++}
++
+ void kugo_cpu_boost(void);
+ 
+ void
+diff --git a/bsd/dev/vince_input.c b/bsd/dev/vince_input.c
+index 9ff6171..a92bbf5 100644
+--- a/bsd/dev/vince_input.c
++++ b/bsd/dev/vince_input.c
+@@ -45,6 +45,9 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+ extern void sweet_hid_key(int key, int down);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++#if defined(KUGO)
++extern uint64_t kugo_touch_events;      /* kugo_perf.c */
++#endif
+ void vince_input_start(void);
+ extern void vince_adreno_init(void);
+ #if defined(KUGO)
+@@ -529,6 +532,9 @@ touch_thread(void *arg, wait_result_t result)
+ 		if (!r && (irq & f12_mask)) {
+ 			r = rmi_read(f12_data, d, sizeof(d));
+ 			if (!r) {
++#if defined(KUGO)
++				kugo_touch_events++;    /* kugo_perf.c's CPU governor boosts on input */
++#endif
+ 				for (int i = 0; i < VINCE_TOUCH_FINGERS; i++) {
+ 					const uint8_t *p = d + 8 * i;
+ 					int down = p[0] == 1 || p[0] == 2;     /* finger, stylus */
