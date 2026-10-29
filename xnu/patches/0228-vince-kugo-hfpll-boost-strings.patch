@@ -1,0 +1,43 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index d81d8c1..8da4672 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2689,16 +2689,14 @@ kugo_cluster_boost(const struct kugo_cluster *c)
+ 	l = l < c->min_l ? c->min_l : l > c->max_l ? c->max_l : l;
+ 	uint8_t range = 0xff, v0 = 0, v1 = 0;
+ 	if (!kugo_pmic_read(c->apc_ppid, 0x40, &range) || range != 0 || !kugo_pmic_read(c->apc_ppid, 0x41, &v0)) {
+-		printf("KUGO CPU: %s rail range %02x unreadable or not range 0, left at 800 MHz
+-", c->name, range);
++		printf("KUGO CPU: %s rail range %02x unreadable or not range 0, left at 800 MHz\n", c->name, range);
+ 		return false;
+ 	}
+ 	uint8_t vset = (uint8_t)((1165 - 80) / 5);
+ 	bool vok = kugo_pmic_write(c->apc_ppid, 0x41, vset);
+ 	delay(2000);
+ 	vok = vok && kugo_pmic_read(c->apc_ppid, 0x41, &v1) && v1 == vset;
+-	printf("KUGO CPU: %s rail %u -> %u mV %s
+-", c->name, 80 + 5 * v0, 80 + 5 * v1, vok ? "ok" : "FAILED");
++	printf("KUGO CPU: %s rail %u -> %u mV %s\n", c->name, 80 + 5 * v0, 80 + 5 * v1, vok ? "ok" : "FAILED");
+ 	if (!vok) {
+ 		(void)kugo_pmic_write(c->apc_ppid, 0x41, v0);
+ 		return false;
+@@ -2721,8 +2719,7 @@ kugo_cluster_boost(const struct kugo_cluster *c)
+ 		delay(10);
+ 	}
+ 	if (!locked) {
+-		printf("KUGO CPU: %s PLL L %u did not lock (mode %#x status %#x), left at 800 MHz
+-", c->name, l,
++		printf("KUGO CPU: %s PLL L %u did not lock (mode %#x status %#x), left at 800 MHz\n", c->name, l,
+ 		    rd(pll, 0x00), rd(pll, 0x1c));
+ 		wr(pll, 0x00, 0);
+ 		(void)kugo_pmic_write(c->apc_ppid, 0x41, v0);
+@@ -2736,8 +2733,7 @@ kugo_cluster_boost(const struct kugo_cluster *c)
+ 	while ((rd(mux, 0x50) & 1) && i++ < 1000) {
+ 		delay(1);
+ 	}
+-	printf("KUGO CPU: %s PLL locked at L %u (%u.%u MHz), mux %#x -> %#x%s
+-", c->name, l, l * 192 / 10,
++	printf("KUGO CPU: %s PLL locked at L %u (%u.%u MHz), mux %#x -> %#x%s\n", c->name, l, l * 192 / 10,
+ 	    l * 192 % 10, old, rd(mux, 0x54), (rd(mux, 0x50) & 1) ? ", update stuck" : "");
+ 	return true;
+ }
