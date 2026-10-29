@@ -1,0 +1,74 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 9b5b398..7514018 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -174,6 +174,7 @@ public:
+ 	uint32_t      fGpuErrors;
+ 	uint64_t      fFb32Gva;
+ 	uint64_t      fGpuUse;
++	bool          fShadowKernelWrites;      /* the kernel wrote the shadow (CPU frame, fade): flush it whole */
+ 	struct {
+ 		SweetSurface *s;
+ 		uint64_t      gva, used;
+@@ -296,6 +297,9 @@ AppleCLCD::start(IOService *provider)
+ 	fClients = OSArray::withCapacity(4);
+ 	if (fPanelBpp == 3) {
+ 		fSurface = fPanel != 0 ? sweet_surface_create_buffer(fShadowW, fShadowH, SWEET_FB_FORMAT_BGRA) : NULL;
++		if (fSurface != NULL) {
++			fRowBytes = fSurface->bytesPerRow;      /* padded to 64 bytes for the GPU */
++		}
+ 	} else
+ #else
+ 	fLock = IOLockAlloc();
+@@ -377,6 +381,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+ 				}
+ 			}
++#if defined(KUGO)
++			fb->fShadowKernelWrites = true;
++#endif
+ #if defined(ARM64_BOARD_CONFIG_VINCE)
+ 			if (fb->fPanelBpp == 3) {
+ 				fb->flushPanel();
+@@ -647,11 +654,18 @@ AppleCLCD::presentGPU(const uint8_t *rec)
+ 		if (!(mask & (1u << layer)) || id == 0) {
+ 			continue;
+ 		}
++		/*
++		 * The default surface (the shadow, which CA also draws into) goes through the GPU too: frames
++		 * alternating between it and GPU surfaces flickered between the two scanout buffers.
++		 */
+ 		SweetSurface *s = sweet_surface_copy(id);
+-		if (s == NULL || s == fSurface) {
+-			OSSafeReleaseNULL(s);
++		if (s == NULL) {
+ 			continue;
+ 		}
++		if (s == fSurface && fShadowKernelWrites) {
++			fShadowKernelWrites = false;
++			kugo_flush_dcache64((addr64_t)fPixels, fRowBytes * fShadowH, FALSE);
++		}
+ 		/* the same clipping as the CPU copy, in logical coordinates */
+ 		if (w <= 0 || h <= 0) {
+ 			w = (int32_t)s->width;
+@@ -849,6 +863,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 			/* the kernel mapping is cached: drop stale lines over what the GPU wrote (and push the CPU's) */
+ 			kugo_flush_dcache64((addr64_t)(src + s->offset + (uint64_t)sy * s->bytesPerRow),
+ 			    (unsigned)((uint64_t)h * s->bytesPerRow), FALSE);
++			fShadowKernelWrites = true;
+ #endif
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 6194a6d..b436f83 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -266,7 +266,7 @@ sweet_surface_create_buffer(uint32_t width, uint32_t height, uint32_t pixelForma
+ 	}
+ 	s->width = width;
+ 	s->height = height;
+-	s->bytesPerRow = width * 4;
++	s->bytesPerRow = (width * 4 + 63) & ~63u;       /* the GPU's texture pitch is a multiple of 64 */
+ 	s->bytesPerElement = 4;
+ 	s->elementWidth = s->elementHeight = 1;
+ 	s->pixelFormat = pixelFormat;
